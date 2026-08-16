@@ -28,7 +28,7 @@ static uint8_t  _rawLUT[64];          // indice RGB222 (6 bits) -> pixel raw
 static bool     vgaReady = false;
 
 // Scratch linear onde o VIC-II escreve a linha corrente.
-static uint16_t lineScratch[VGA_XRES];
+static uint16_t lineScratch[VGA_XRES] __attribute__((aligned(4)));
 static int      pendingLine = -1;
 
 // Contadores de desempenho.
@@ -47,7 +47,7 @@ static void IRAM_ATTR drawScanline(void *arg, uint8_t *dest, int scanLine)
 // Dentro de cada palavra de 32 bits alinhada isso e' a ordem de bytes
 // { px2, px3, px0, px1 }: montamos a palavra e gastamos 1 store por 4 pixels.
 // ---------------------------------------------------------------------------
-static inline void flushLine(int y)
+static void IRAM_ATTR flushLine(int y)
 {
   if (!vgaReady || (unsigned)y >= VGA_YRES) return;
 
@@ -56,14 +56,23 @@ static inline void flushLine(int y)
 #endif
 
   uint32_t       *dst = (uint32_t *)(_fb + y * VGA_XRES);
-  const uint16_t *src = lineScratch;
+  const uint32_t *src = (const uint32_t *)lineScratch;  // 2 pixels por palavra
+  const uint8_t  *lut = _rawLUT;
 
+  // O scratch e' uint16_t por pixel (so' os 6 bits baixos importam). Lendo de
+  // 32 em 32 bits pegamos DOIS pixels por acesso: metade das leituras que a
+  // versao anterior fazia.
+  //
+  // O destino precisa do swizzle x^2, que dentro de uma palavra alinhada e' a
+  // ordem de bytes { px2, px3, px0, px1 }. Montamos a palavra e gravamos de
+  // uma vez: 1 store a cada 4 pixels.
   for (int x = 0; x < VGA_XRES; x += 4) {
-    uint32_t p0 = _rawLUT[src[0] & 0x3F];
-    uint32_t p1 = _rawLUT[src[1] & 0x3F];
-    uint32_t p2 = _rawLUT[src[2] & 0x3F];
-    uint32_t p3 = _rawLUT[src[3] & 0x3F];
-    src += 4;
+    uint32_t a = *src++;                    // px0 | px1 << 16
+    uint32_t b = *src++;                    // px2 | px3 << 16
+    uint32_t p0 = lut[a & 0x3F];
+    uint32_t p1 = lut[(a >> 16) & 0x3F];
+    uint32_t p2 = lut[b & 0x3F];
+    uint32_t p3 = lut[(b >> 16) & 0x3F];
     *dst++ = p2 | (p3 << 8) | (p0 << 16) | (p1 << 24);
   }
 

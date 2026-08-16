@@ -180,7 +180,9 @@ void emu_setup(void)
 
 void emu_loop(void)
 {
-  video.refresh();   // libera a ultima linha do quadro que ficou no scratch
+  // video.refresh() saiu daqui: era chamado 15600 vezes por segundo so' para
+  // checar um flag. O getLineBuffer() ja converte a linha anterior quando a
+  // proxima e' pedida -- inclusive na volta da linha 239 para a 0.
   main_step();
 
   // c64_Step() emula UMA linha de raster, entao main_step() e' chamado umas
