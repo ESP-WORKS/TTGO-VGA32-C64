@@ -1,0 +1,500 @@
+diff -ruN a/main/AudioPlaySystem.cpp b/main/AudioPlaySystem.cpp
+--- a/main/AudioPlaySystem.cpp	2026-08-15 14:07:55.170896267 +0000
++++ b/main/AudioPlaySystem.cpp	2026-08-15 14:10:06.274994307 +0000
+@@ -189,7 +189,10 @@
+ 	//i2s_driver_install(I2S_NUM, &i2s_config, 4, &queue);
+   i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+   i2s_set_pin(I2S_NUM, NULL);
+-  i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN); 
++  // RIGHT_EN = DAC1 = GPIO25. LEFT_EN would be DAC2 = GPIO26, which the
++  // T-Display link needs for TX. The mixer duplicates mono into L and R, so the
++  // audio is identical either way.
++  i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN); 
+ 	//I2S enables *both* DAC channels; we only need DAC1.
+ 	//ToDo: still needed now I2S supports set_dac_mode?
+ 	//CLEAR_PERI_REG_MASK(RTC_IO_PAD_DAC1_REG, RTC_IO_PDAC1_DAC_XPD_FORCE_M);
+diff -ruN a/main/c64.cpp b/main/c64.cpp
+--- a/main/c64.cpp	2026-08-15 14:07:55.161412015 +0000
++++ b/main/c64.cpp	2026-08-15 14:10:32.820751614 +0000
+@@ -5,6 +5,10 @@
+ #include "Teensy64.h"
+ #include <string.h>
+ 
++#ifdef HAS_TDISPLAY_LINK
++#include "port_link.h"
++#endif
++
+ #ifdef HAS_SND
+ #include "reSID.h"
+ AudioPlaySID playSID;
+@@ -142,6 +146,18 @@
+ }
+ 
+ 
++#ifdef HAS_TDISPLAY_LINK
++/* LINK_BUTTON2 (B/Y) as a *held* key on the emulated keyboard. setKey() is a
++   20 ms pulse and cannot represent a held key, so the matrix is driven directly
++   from here, in parallel with kbdData. Returns 0 when nothing is held. */
++static inline uint8_t link_heldScancode(void) {
++  uint16_t k = link_get_stkey();
++  if (!k || k >= (sizeof(ascii2scan)/sizeof(ascii2scan[0]))) return 0;
++  return (uint8_t)(ascii2scan[k] & 0xFF);
++}
++#endif
++
++
+ uint8_t cia1PORTA(void) {
+ 
+   uint8_t v;
+@@ -162,6 +178,15 @@
+     if (keys & MASK_JOY1_LEFT) v &= 0xF7;
+   }	
+ 
++#ifdef HAS_TDISPLAY_LINK
++  {
++    uint8_t lk = link_heldScancode();
++    if (lk) {
++      uint8_t lf = ~cpu.cia1.R[0x01] & cpu.cia1.R[0x03];
++      if (keymatrixmap[1][lk] & lf) v &= ~keymatrixmap[0][lk];
++    }
++  }
++#endif
+ 
+   if (!kbdData.kv) return v; //Keine Taste gedrückt
+ 
+@@ -212,6 +237,16 @@
+     if (keys & MASK_JOY2_LEFT) v &= 0xF7;
+   }
+ 
++#ifdef HAS_TDISPLAY_LINK
++  {
++    uint8_t lk = link_heldScancode();
++    if (lk) {
++      uint8_t lf = ~cpu.cia1.R[0x00] & cpu.cia1.R[0x02];
++      if (keymatrixmap[0][lk] & lf) v &= ~keymatrixmap[1][lk];
++    }
++  }
++#endif
++
+   if (!kbdData.kv) return v; //Keine Taste gedrückt
+ 
+   uint8_t filter = ~cpu.cia1.R[0x00] & cpu.cia1.R[0x02];
+diff -ruN a/main/emuapi.cpp b/main/emuapi.cpp
+--- a/main/emuapi.cpp	2026-08-15 14:07:55.172104754 +0000
++++ b/main/emuapi.cpp	2026-08-15 14:09:14.998223564 +0000
+@@ -15,6 +15,10 @@
+ #include "bmpjoy.h"
+ #include "bmpvbar.h"
+ 
++#ifdef HAS_TDISPLAY_LINK
++#include "port_link.h"
++#endif
++
+ #include "esp_event.h"
+ #include "esp_vfs_fat.h"
+ #include "driver/sdspi_host.h"
+@@ -203,6 +207,9 @@
+ 
+ void toggleMenu(bool on) {
+   if (on) {
++#ifdef HAS_TDISPLAY_LINK
++    link_send_game_name("");   // no game is running
++#endif
+     callibrationOn=false;
+     menuOn=true;
+     menuRedraw=true;  
+@@ -811,6 +818,11 @@
+   uint16_t retval;
+   uint16_t j1 = readAnalogJoystick();
+ 
++#ifdef HAS_TDISPLAY_LINK
++  // OR-merged so the local joystick and the bluetooth pad both drive the game.
++  j1 |= link_get_mask();
++#endif
++
+   uint16_t j2 = 0;
+ 
+   if (joySwapped) {
+@@ -821,7 +833,9 @@
+   }
+ 
+   if (gpio_get_level((gpio_num_t)PIN_KEY_USER1) == 0 ) retval |= MASK_KEY_USER1;
++#ifndef HAS_TDISPLAY_LINK
+   if (gpio_get_level((gpio_num_t)PIN_KEY_USER2) == 0 ) retval |= MASK_KEY_USER2;
++#endif
+   if (gpio_get_level((gpio_num_t)PIN_KEY_USER3) == 0 ) retval |= MASK_KEY_USER3;
+   if (gpio_get_level((gpio_num_t)PIN_KEY_USER4) == 0 ) retval |= MASK_KEY_USER4;
+ 
+@@ -884,8 +898,10 @@
+   gpio_set_pull_mode((gpio_num_t)PIN_JOY2_BTN, GPIO_PULLUP_ONLY);
+   gpio_set_direction((gpio_num_t)PIN_KEY_USER1, GPIO_MODE_INPUT);
+   gpio_set_pull_mode((gpio_num_t)PIN_KEY_USER1, GPIO_PULLUP_ONLY);
++#ifndef HAS_TDISPLAY_LINK
+   gpio_set_direction((gpio_num_t)PIN_KEY_USER2, GPIO_MODE_INPUT);
+   gpio_set_pull_mode((gpio_num_t)PIN_KEY_USER2, GPIO_PULLUP_ONLY);
++#endif
+   gpio_set_direction((gpio_num_t)PIN_KEY_USER3, GPIO_MODE_INPUT);
+   gpio_set_pull_mode((gpio_num_t)PIN_KEY_USER3, GPIO_PULLUP_ONLY);
+   gpio_set_direction((gpio_num_t)PIN_KEY_USER4, GPIO_MODE_INPUT);
+diff -ruN a/main/emuapi.h b/main/emuapi.h
+--- a/main/emuapi.h	2026-08-15 14:07:55.173262615 +0000
++++ b/main/emuapi.h	2026-08-15 14:08:44.250718375 +0000
+@@ -7,6 +7,9 @@
+ #define CUSTOM_SND  1
+ #define HAS_I2CKBD  1
+ #define USE_WIRE    1
++// TTGO T-Display bluetooth controller bridge over UART2.
++// Costs PIN_KEY_USER2 (GPIO34, becomes the link RX) and moves audio to DAC1.
++#define HAS_TDISPLAY_LINK 1
+ 
+ 
+ // Title:     <                                        >
+diff -ruN a/main/go.cpp b/main/go.cpp
+--- a/main/go.cpp	2026-08-15 14:07:55.160814264 +0000
++++ b/main/go.cpp	2026-08-15 14:09:38.797606173 +0000
+@@ -9,6 +9,9 @@
+ 
+ #include "keyboard_osd.h"
+ #include "ili9341_t3dma.h"
++#ifdef HAS_TDISPLAY_LINK
++#include "port_link.h"
++#endif
+ #ifdef HAS_SND
+ #include "AudioPlaySystem.h"
+ #endif
+@@ -31,6 +34,9 @@
+ static void input_task(void *args)
+ {
+   while(true) {
++#ifdef HAS_TDISPLAY_LINK
++    link_poll();   // core 0, a few bytes out of a FIFO: costs nothing
++#endif
+     if ( ((emu_ReadKeys() & (MASK_KEY_USER1+MASK_KEY_USER2)) == (MASK_KEY_USER1+MASK_KEY_USER2))
+       || (emu_ReadKeys() & MASK_KEY_USER4 ) )
+     {  
+@@ -53,8 +59,16 @@
+   } 
+ }
+ 
++static bool inputTaskStarted = false;
++
+ static void main_step() {
+   if (menuActive()) {
++#ifdef HAS_TDISPLAY_LINK
++    // input_task may not exist yet (or the picker was re-opened while it runs
++    // but does not own this branch): without this the pad looks dead in the
++    // ROM picker.
++    link_poll();
++#endif
+     uint16_t bClick = emu_DebounceLocalKeys();
+     int action = handleMenu(bClick);
+     char * filename = menuSelection();
+@@ -65,12 +79,29 @@
+ #endif                 
+       toggleMenu(false); 
+       tft.fillScreenNoDma( RGBVAL16(0x00,0x00,0x00) );
+-      xTaskCreatePinnedToCore(input_task, "inputthread", 4096, NULL, 2, NULL, 0);
++      if (!inputTaskStarted) {
++        xTaskCreatePinnedToCore(input_task, "inputthread", 4096, NULL, 2, NULL, 0);
++        inputTaskStarted = true;
++      }
++#ifdef HAS_TDISPLAY_LINK
++      link_send_game_name(filename);   // before emu_Init, which may block
++#endif
+       emu_Init(filename);        
++#ifdef HAS_TDISPLAY_LINK
++      // A button held during the load must not fire the instant the game starts.
++      g_menuRequest = false;
++#endif
+     }       
+     //vTaskDelay(20 / portTICK_PERIOD_MS); 
+   }
+   else {         
++#ifdef HAS_TDISPLAY_LINK
++    if (g_menuRequest) {
++      g_menuRequest = false;
++      toggleMenu(true);   // clears the T-Display "now playing" line
++      return;
++    }
++#endif
+     emu_Step();     
+   }
+ }
+@@ -79,7 +110,11 @@
+ void setup(void)
+ {
+   printf("Starting emulator\n");
+-  
++
++#ifdef HAS_TDISPLAY_LINK
++  link_init();          // before anything that might block (SD mount, etc.)
++#endif
++
+ 	tft.begin();
+ 	tft.flipscreen(true);  
+ 	tft.start();
+diff -ruN a/main/iopins.h b/main/iopins.h
+--- a/main/iopins.h	2026-08-15 14:07:55.173624499 +0000
++++ b/main/iopins.h	2026-08-15 14:08:39.833369925 +0000
+@@ -36,9 +36,15 @@
+ #define PIN_JOY2_BTN    32
+ 
+ #define PIN_KEY_USER1   35
+-#define PIN_KEY_USER2   34
++#define PIN_KEY_USER2   34   // <-- reused as LINK_PIN_RX when HAS_TDISPLAY_LINK
+ #define PIN_KEY_USER3   39
+ #define PIN_KEY_USER4   36
++
++// TTGO T-Display controller bridge (UART2)
++// GPIO34 is input-only: fine for RX, unusable for TX.
++// GPIO26 is DAC2. AudioPlaySystem was moved to DAC1 (GPIO25) to free it.
++#define LINK_PIN_RX     (gpio_num_t)34
++#define LINK_PIN_TX     (gpio_num_t)26
+ /*
+ #define PIN_KEY_ESCAPE  23
+ */
+diff -ruN a/main/port_link.cpp b/main/port_link.cpp
+--- a/main/port_link.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/main/port_link.cpp	2026-08-15 14:10:42.981381042 +0000
+@@ -0,0 +1,193 @@
++#include <stdio.h>
++#include <string.h>
++
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++#include "driver/uart.h"
++#include "driver/gpio.h"
++
++extern "C" {
++  #include "emuapi.h"        /* MASK_JOY2_* */
++  #include "iopins.h"        /* LINK_PIN_RX / LINK_PIN_TX */
++}
++#include "port_link.h"       /* MUST be included here: keeps these definitions
++                                extern "C", otherwise the C callers get an
++                                "undefined reference to link_init" at link time */
++
++#define LINK_UART       UART_NUM_2
++#define LINK_BAUD       115200
++#define LINK_RX_BUFSZ   256
++
++#define LINK_MARKER     0xFF
++#define LINK_STX        0x02
++#define LINK_ETX        0x03
++
++/* pad byte */
++#define LINK_UP         0x01
++#define LINK_DOWN       0x02
++#define LINK_LEFT       0x04
++#define LINK_RIGHT      0x08
++#define LINK_BUTTON2    0x10
++#define LINK_BUTTON1    0x20
++
++/* sys byte */
++#define LINK_START      0x01
++#define LINK_PAUSE      0x02
++#define LINK_SOFT_RESET 0x04
++#define LINK_HARD_RESET 0x08
++
++volatile bool g_menuRequest = false;
++
++static bool     s_ready    = false;
++static uint8_t  s_pad      = 0;
++static uint8_t  s_sys      = 0;
++static bool     s_prevMenu = false;
++static uint8_t  s_state    = 0;    /* 0 idle, 1 want pad, 2 want sys */
++static uint8_t  s_pending  = 0;
++
++/* link_poll() is called from input_task (core 0) and, while the ROM picker is
++   up, from the main loop (core 1). Both can be live at once once a game has
++   been launched and the picker re-opened, so the decoder state is guarded. */
++static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
++
++
++void link_init(void)
++{
++    uart_config_t cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.baud_rate           = LINK_BAUD;
++    cfg.data_bits           = UART_DATA_8_BITS;
++    cfg.parity              = UART_PARITY_DISABLE;
++    cfg.stop_bits           = UART_STOP_BITS_1;
++    cfg.flow_ctrl           = UART_HW_FLOWCTRL_DISABLE;
++    cfg.rx_flow_ctrl_thresh = 0;
++
++    if (uart_param_config(LINK_UART, &cfg) != ESP_OK) {
++        printf("LINK: uart_param_config failed\n");
++        return;
++    }
++    if (uart_set_pin(LINK_UART, LINK_PIN_TX, LINK_PIN_RX,
++                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK) {
++        printf("LINK: uart_set_pin failed\n");
++        return;
++    }
++    /* tx buffer 0 => uart_write_bytes blocks until the bytes are queued.
++       The game name is 43 bytes max, ~4 ms at 115200. */
++    if (uart_driver_install(LINK_UART, LINK_RX_BUFSZ, 0, 0, NULL, 0) != ESP_OK) {
++        printf("LINK: uart_driver_install failed\n");
++        return;
++    }
++
++    s_ready = true;
++    printf("LINK: T-Display bridge up on UART2 (RX=%d TX=%d)\n",
++           (int)LINK_PIN_RX, (int)LINK_PIN_TX);
++}
++
++
++static void link_feed(uint8_t b)
++{
++    if (b >= 0x80) {                       /* marker, or resync after a loss */
++        s_state = (b == LINK_MARKER) ? 1 : 0;
++        return;
++    }
++    switch (s_state) {
++        case 1:
++            s_pending = b;
++            s_state   = 2;
++            break;
++        case 2:
++            s_pad   = s_pending;
++            s_sys   = b;
++            s_state = 0;
++#if LINK_TRACE
++            printf("LINK pad=0x%02X sys=0x%02X\n", s_pad, s_sys);
++#endif
++            break;
++        default:
++            break;                         /* stray byte, ignore */
++    }
++}
++
++
++/* Never blocks. Called from input_task (core 0) while a game runs and from the
++   main loop while the ROM picker is up. */
++void link_poll(void)
++{
++    if (!s_ready) return;
++
++    uint8_t buf[64];
++    int n;
++    while ((n = uart_read_bytes(LINK_UART, buf, sizeof(buf), 0)) > 0) {
++        portENTER_CRITICAL(&s_mux);
++        for (int i = 0; i < n; i++) link_feed(buf[i]);
++        portEXIT_CRITICAL(&s_mux);
++        if (n < (int)sizeof(buf)) break;
++    }
++
++    /* Home/Heart -> open the ROM picker. Edge-triggered; the bit is never
++       passed on to the emulator core. */
++    bool menu = (s_sys & LINK_SOFT_RESET) != 0;
++    if (menu && !s_prevMenu) g_menuRequest = true;
++    s_prevMenu = menu;
++}
++
++
++/* Wire bits -> this emulator's mask. MCUME esp64 uses
++   RIGHT 0x0001 / LEFT 0x0002 / UP 0x0004 / DOWN 0x0008 / BTN 0x0010,
++   which matches none of the wire values, so translate explicitly. */
++uint16_t link_get_mask(void)
++{
++    if (!s_ready) return 0;
++    uint16_t m = 0;
++    if (s_pad & LINK_UP)      m |= MASK_JOY2_UP;
++    if (s_pad & LINK_DOWN)    m |= MASK_JOY2_DOWN;
++    if (s_pad & LINK_LEFT)    m |= MASK_JOY2_LEFT;
++    if (s_pad & LINK_RIGHT)   m |= MASK_JOY2_RIGHT;
++    if (s_pad & LINK_BUTTON1) m |= MASK_JOY2_BTN;
++    return m;
++}
++
++
++/* The C64 joystick port has a single fire button, so BUTTON2 has nowhere to go
++   on the joystick. Returned as an ASCII code and folded into the emulated
++   keyboard (see emu_ReadI2CKeyboard / c64_SetLinkHeldKey). 0 = unused. */
++uint16_t link_get_stkey(void)
++{
++    if (!s_ready) return 0;
++#if LINK_BUTTON2_AS_SPACE
++    return (s_pad & LINK_BUTTON2) ? 0x20 : 0;   /* 0x20 = SPACE */
++#else
++    return 0;
++#endif
++}
++
++
++void link_send_game_name(const char *path)
++{
++    if (!s_ready) return;
++
++    char name[41];
++    name[0] = '\0';
++
++    if (path && *path) {                   /* strip directory and extension */
++        const char *base = strrchr(path, '/');
++        base = base ? base + 1 : path;
++        size_t n = strlen(base);
++        const char *dot = strrchr(base, '.');
++        if (dot && dot != base) n = (size_t)(dot - base);
++        if (n > sizeof(name) - 1) n = sizeof(name) - 1;
++        memcpy(name, base, n);
++        name[n] = '\0';
++    }
++
++    size_t len = strlen(name);
++    const uint8_t stx = LINK_STX;
++    const uint8_t etx = LINK_ETX;
++
++    for (int i = 0; i < 3; i++) {          /* redundancy instead of retry */
++        uart_write_bytes(LINK_UART, (const char *)&stx, 1);
++        if (len) uart_write_bytes(LINK_UART, name, len);
++        uart_write_bytes(LINK_UART, (const char *)&etx, 1);
++        if (i < 2) vTaskDelay(15 / portTICK_PERIOD_MS);
++    }
++}
+diff -ruN a/main/port_link.h b/main/port_link.h
+--- a/main/port_link.h	1970-01-01 00:00:00.000000000 +0000
++++ b/main/port_link.h	2026-08-15 14:08:05.055743318 +0000
+@@ -0,0 +1,44 @@
++#ifndef PORT_LINK_H
++#define PORT_LINK_H
++
++/*
++ * TTGO T-Display controller bridge - MCUME esp64 (C64) port.
++ *
++ * Wire protocol and rationale: see TTGO-T-DISPLAY-Implement.md.
++ * The T-Display firmware is used unmodified; everything here is the
++ * receiving side.
++ *
++ * NOTE: this project is plain ESP-IDF (no Arduino core), so the reference
++ * implementation's Serial2 is replaced by the IDF UART driver on UART_NUM_2.
++ */
++
++#include <stdint.h>
++#include <stdbool.h>
++
++/* 1 = print every decoded pad/sys pair, to identify a controller's buttons. */
++#define LINK_TRACE 0
++
++/* 1 = LINK_BUTTON2 (B/Y) acts as a held SPACE on the emulated C64 keyboard.
++   0 = LINK_BUTTON2 is discarded (the C64 joystick has a single fire button). */
++#define LINK_BUTTON2_AS_SPACE 1
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Set by link_poll() when the Home/Heart button goes down.
++   Consumed (and cleared) by the main loop in go.cpp - never act on it from
++   inside an input handler. */
++extern volatile bool g_menuRequest;
++
++void     link_init(void);                       /* UART2 up; once at boot     */
++void     link_poll(void);                       /* drain RX; never blocks     */
++uint16_t link_get_mask(void);                   /* controller -> MASK_JOY2_*  */
++uint16_t link_get_stkey(void);                  /* BUTTON2 -> ASCII, or 0     */
++void     link_send_game_name(const char *path); /* "" or NULL clears it       */
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
