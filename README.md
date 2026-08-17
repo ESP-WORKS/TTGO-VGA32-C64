@@ -1,4 +1,9 @@
-# MCUME esp64 — Commodore 64 for the TTGO VGA32
+TTGO-VGA32 -C64 - Commodore 64 for the TTGO VGA32, Olimex and ROBGO_RG
+
+<p align="center">
+  <img src="screen1.jpeg" width="45%">
+  <img src="screen2.jpeg" width="45%">
+</p>
 
 A port of the [MCUME](https://github.com/Jean-MarcHarvengt/MCUME) Commodore 64 emulator (by Jean-Marc Harvengt) to the **TTGO VGA32** board, with native **VGA output**, a **PS/2 keyboard**, and an optional **Bluetooth controller** over a serial bridge to a TTGO T-Display.
 
