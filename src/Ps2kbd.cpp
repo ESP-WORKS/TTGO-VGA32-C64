@@ -26,6 +26,7 @@
 #define M_JOY2_DOWN  0x0008
 #define M_JOY2_BTN   0x0010
 #define M_KEY_USER1  0x0020   // dispara a macro LOAD""+RUN no c64_Input()
+#define M_KEY_MENU   0x4000   // F6: reabre o menu durante o jogo
 
 static fabgl::PS2Controller ps2;
 static bool     kbdReady = false;
@@ -60,6 +61,9 @@ static uint16_t maskOf(fabgl::VirtualKey vk) {
     // ou seja, o arquivo escolhido no menu. Note que so' funciona com .PRG:
     // o patch le 2 bytes de endereco e despeja o resto na RAM.
     case fabgl::VK_F1:     return M_KEY_USER1;
+    // F6 reabre o menu durante o jogo (o C64 sozinho nao teria essa tecla;
+    // e' so' um atalho nosso). Consumido em go.cpp, uma vez por quadro.
+    case fabgl::VK_F6:     return M_KEY_MENU;
     case fabgl::VK_KP_ENTER:return M_JOY2_BTN;
     default:               return 0;
   }

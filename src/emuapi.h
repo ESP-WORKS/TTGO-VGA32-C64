@@ -114,6 +114,7 @@ const unsigned short i2ckeys[] = {
 #define MASK_JOY1_DOWN  0x0800
 #define MASK_JOY1_BTN   0x1000
 #define MASK_KEY_USER4  0x2000
+#define MASK_KEY_MENU   0x4000  // F6 no PS/2: reabre o menu durante o jogo
 
 
 extern void emu_init(void);

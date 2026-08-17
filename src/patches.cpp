@@ -34,6 +34,7 @@
 */
 
 #include "patches.h"
+#include <string.h>
 
 
 #define DIRECTORY ROMSDIR + "/\0"
@@ -42,6 +43,182 @@ static char filename[64];
 static char buffer[2];
 
 extern char * menuSelection(void);
+
+
+/* ===========================================================================
+   Suporte a .T64 (Tape containers for C64s)
+
+   Layout exato conforme T64.TXT (Peter Schepers, revisao 1.5):
+   https://ist.uwaterloo.ca/~schepers/formats/T64.TXT
+
+     offset 0x00-0x02 : assinatura "C64" (ASCII)
+     offset 0x24-0x25 : numero de entradas USADAS no diretorio (low/high)
+     offset 0x40 + n*32 : entradas de diretorio, 32 bytes cada
+       +0x00 : tipo C64s (0 = livre, 1 = arquivo normal -- so' isto suportamos)
+       +0x01 : tipo 1541 (na pratica, != 0 significa PRG)
+       +0x02-03 : endereco de carga (load address)
+       +0x04-05 : endereco final -- NAO CONFIAVEL. Ha' T64s antigos gerados
+                  pelo CONV64 com bug conhecido que grava $C3C6 fixo aqui
+                  independente do tamanho real. Nunca usamos este campo.
+       +0x08-0B : offset do arquivo dentro do container (32 bits, low/high)
+       +0x10-1F : nome do arquivo, 16 bytes, ASCII, padded com espaco ($20,
+                  nao $A0 como no disco -- por isso nomes T64 nao podem ter
+                  espaco no final)
+
+   Como o formato nao guarda o tamanho de cada arquivo, ele e' inferido pela
+   diferenca entre o offset desta entrada e o offset da proxima entrada mais
+   proxima no arquivo (ou o fim do arquivo, para a ultima). Por isso lemos o
+   diretorio inteiro antes de decidir o tamanho de qualquer entrada.
+
+   Sessao T64: LOAD"" com um .t64 selecionado no menu abre o container e
+   carrega a primeira entrada valida. Enquanto esse container continuar
+   "aberto" (s_t64Container nao vazio), um LOAD"NOME" subsequente procura
+   NOME dentro do MESMO container em vez de tentar abrir "NOME" como arquivo
+   solto no cartao -- e' o padrao que jogos multi-parte usam (ex.: o loader
+   faz LOAD"PART2",8,1 depois do primeiro LOAD""). LOAD"*" carrega a proxima
+   entrada em ordem, tambem um idioma comum em loaders C64.
+   =========================================================================== */
+
+#define T64_DIR_ENTRY_SIZE  32
+#define T64_DIR_START       0x40
+#define T64_MAX_ENTRIES     64    /* qualquer T64 real cabe nisso; sem alloc dinamico */
+
+typedef struct {
+  uint16_t loadAddr;
+  uint32_t fileOffset;
+  char     name[17];
+} T64Entry;
+
+static char s_t64Container[64] = "";   /* "" = nenhuma sessao T64 ativa */
+static int  s_t64NextIndex = 0;
+
+static int t64IsT64(const char *fname) {
+  int len = strlen(fname);
+  if (len < 4) return 0;
+  const char *ext = fname + len - 4;
+  return (ext[0] == '.' &&
+          (ext[1] == 't' || ext[1] == 'T') &&
+          (ext[2] == '6') &&
+          (ext[3] == '4'));
+}
+
+/* Compara ignorando maiusc/minusc; nomes T64 ja' vem sem o padding de espacos
+   (removido em t64ReadDirectory), entao os dois devem terminar juntos. */
+static int t64NamesMatch(const char *a, const char *b) {
+  while (*a && *b) {
+    char ca = *a++, cb = *b++;
+    if (ca >= 'a' && ca <= 'z') ca -= 32;
+    if (cb >= 'a' && cb <= 'z') cb -= 32;
+    if (ca != cb) return 0;
+  }
+  return (*a == 0 && *b == 0);
+}
+
+/* Le o diretorio inteiro do container ja' identificado por 'container'.
+   Devolve o numero de entradas validas lidas (0 se nao for um T64 valido). */
+static int t64ReadDirectory(const char *container, T64Entry *entries, int maxEntries) {
+  if (emu_FileOpen((char*)container) == 0) return 0;
+
+  uint8_t hdr[T64_DIR_START];
+  int gotHdr = (emu_FileRead((char*)hdr, sizeof(hdr)) == (int)sizeof(hdr));
+
+  if (!gotHdr || hdr[0] != 'C' || hdr[1] != '6' || hdr[2] != '4') {
+    emu_FileClose();
+    return 0;
+  }
+
+  int used = hdr[0x24] | (hdr[0x25] << 8);
+  if (used > maxEntries) used = maxEntries;
+
+  int count = 0;
+  for (int i = 0; i < used; i++) {
+    uint8_t e[T64_DIR_ENTRY_SIZE];
+    emu_FileSeek(T64_DIR_START + i * T64_DIR_ENTRY_SIZE);
+    if (emu_FileRead((char*)e, T64_DIR_ENTRY_SIZE) != T64_DIR_ENTRY_SIZE) break;
+
+    if (e[0] != 1) continue;  /* 0 = entrada livre; so' aceitamos "arquivo normal" */
+
+    T64Entry *t = &entries[count];
+    t->loadAddr   = e[2] | (e[3] << 8);
+    t->fileOffset = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
+                    ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
+    memcpy(t->name, &e[0x10], 16);
+    t->name[16] = 0;
+    for (int j = 15; j >= 0 && t->name[j] == ' '; j--) t->name[j] = 0;
+    count++;
+  }
+
+  emu_FileClose();
+  return count;
+}
+
+/* Tamanho de uma entrada = offset da proxima entrada mais proxima (por
+   POSICAO no arquivo, nao por indice de diretorio) menos o offset desta.
+   A ultima usa o tamanho do container inteiro. O "endereco final" do
+   cabecalho nunca e' usado (ver nota do bug do CONV64 acima). */
+static int t64EntrySize(T64Entry *entries, int count, int idx, int containerSize) {
+  uint32_t start = entries[idx].fileOffset;
+  uint32_t bestNext = (uint32_t)containerSize;
+  for (int i = 0; i < count; i++) {
+    if (entries[i].fileOffset > start && entries[i].fileOffset < bestNext)
+      bestNext = entries[i].fileOffset;
+  }
+  return (int)(bestNext - start);
+}
+
+/* Carrega a entrada 'idx' direto na RAM do C64. Devolve 0 se falhar. */
+static int t64LoadEntry(const char *container, T64Entry *entries, int count, int idx) {
+  int containerSize = emu_FileSize((char*)container);
+  int size = t64EntrySize(entries, count, idx, containerSize);
+  if (size < 2) return 0;
+
+  if (emu_FileOpen((char*)container) == 0) return 0;
+  emu_FileSeek(entries[idx].fileOffset);
+
+  uint8_t addrBytes[2];
+  emu_FileRead((char*)addrBytes, 2);
+  uint16_t addr = addrBytes[0] | (addrBytes[1] << 8);
+
+  emu_FileRead((char*)&cpu.RAM[addr], size - 2);
+  emu_FileClose();
+
+  cpu.RAM[0xAF] = (addr + size - 2) & 0xff;
+  cpu.RAM[0xAE] = (addr + size - 2) / 256;
+
+  printf("T64: \"%s\" carregada em $%04X, %d bytes\n", entries[idx].name, addr, size - 2);
+  return 1;
+}
+
+/* Ponto de entrada usado pelo patchLOAD(). 'reqName' == NULL ou "*" carrega a
+   proxima entrada em ordem; qualquer outro valor busca esse nome no
+   diretorio. Devolve 1 se carregou, 0 se nao achou / erro. */
+static int t64Load(const char *reqName) {
+  T64Entry entries[T64_MAX_ENTRIES];
+  int count = t64ReadDirectory(s_t64Container, entries, T64_MAX_ENTRIES);
+  if (count == 0) {
+    printf("T64: nao consegui ler o diretorio de \"%s\"\n", s_t64Container);
+    return 0;
+  }
+
+  int idx = -1;
+  if (reqName == NULL || strcmp(reqName, "*") == 0) {
+    if (s_t64NextIndex < count) idx = s_t64NextIndex;
+  } else {
+    for (int i = 0; i < count; i++) {
+      if (t64NamesMatch(entries[i].name, reqName)) { idx = i; break; }
+    }
+  }
+
+  if (idx < 0) {
+    printf("T64: \"%s\" nao encontrado em \"%s\" (%d entradas)\n",
+           reqName ? reqName : "*", s_t64Container, count);
+    return 0;
+  }
+
+  int ok = t64LoadEntry(s_t64Container, entries, count, idx);
+  if (ok) s_t64NextIndex = idx + 1;
+  return ok;
+}
 
 void patchLOAD(void) {
 
@@ -191,6 +368,31 @@ uint16_t addr,size;
 
 	printf("%s,%d,%d:", filename, device, secondaryAddress);
 
+	// --- Sessao T64 ---------------------------------------------------------
+	// LOAD"" com um .t64 selecionado no menu: abre o container e lembra dele.
+	// LOAD"NOME" com uma sessao T64 ativa: procura NOME dentro do MESMO
+	// container, em vez de tratar "NOME" como um arquivo solto no cartao --
+	// e' o padrao que loaders multi-parte usam.
+	if (cpu.RAM[0xB7] == 0) {
+		s_t64Container[0] = 0;
+		if (t64IsT64(filename)) {
+			strncpy(s_t64Container, filename, sizeof(s_t64Container) - 1);
+			s_t64NextIndex = 0;
+		}
+	}
+
+	if (s_t64Container[0] != 0) {
+		int ok = (cpu.RAM[0xB7] == 0) ? t64Load(NULL) : t64Load(filename);
+		if (!ok) {
+			printf("not found.\n");
+			cpu.pc = 0xf530; //Jump to $F530
+			return;
+		}
+		cpu.y = 0x49; //Offset for "LOADING"
+		cpu.pc = 0xF12B; //Print and return
+		printf("loaded.\n");
+		return;
+	}
 
 	if (emu_FileOpen(filename) == 0) {
 		printf("not found.\n");

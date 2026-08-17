@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include "esp_heap_caps.h"
+#include "esp_partition.h"
 #include "go.h"
 
 extern "C" {
@@ -74,6 +75,33 @@ static void input_task(void *args)
 
 static bool inputTaskStarted = false;
 
+// Sequencia de "sair do menu e rodar". Usada em dois lugares: quando o
+// usuario escolhe um arquivo e aperta ENTER, e no boot (emu_setup chama isto
+// direto com filename="", pulando o menu -- igual a ligar um C64 de verdade,
+// que cai direto no BASIC).
+static void startGame(char *filename) {
+#ifdef HAS_SND      
+  audio.begin();
+  audio.start();
+#endif                 
+  toggleMenu(false); 
+  video.fillScreenNoDma( RGBVAL16(0x00,0x00,0x00) );
+  if (!inputTaskStarted) {
+    // Core 1: tira do core 0 tudo que nao e' o emulador. O audio.step()
+    // desta task chama i2s_write, que pode bloquear.
+    xTaskCreatePinnedToCore(input_task, "inputthread", 4096, NULL, 2, NULL, 1);
+    inputTaskStarted = true;
+  }
+#ifdef HAS_TDISPLAY_LINK
+  link_send_game_name(filename);   // before emu_Init, which may block
+#endif
+  emu_Init(filename);        
+#ifdef HAS_TDISPLAY_LINK
+  // A button held during the load must not fire the instant the game starts.
+  g_menuRequest = false;
+#endif
+}
+
 static void main_step() {
   if (menuActive()) {
 #ifdef HAS_TDISPLAY_LINK
@@ -86,26 +114,7 @@ static void main_step() {
     int action = handleMenu(bClick);
     char * filename = menuSelection();
     if (action == ACTION_RUN) {
-#ifdef HAS_SND      
-      audio.begin();
-      audio.start();
-#endif                 
-      toggleMenu(false); 
-      video.fillScreenNoDma( RGBVAL16(0x00,0x00,0x00) );
-      if (!inputTaskStarted) {
-        // Core 1: tira do core 0 tudo que nao e' o emulador. O audio.step()
-        // desta task chama i2s_write, que pode bloquear.
-        xTaskCreatePinnedToCore(input_task, "inputthread", 4096, NULL, 2, NULL, 1);
-        inputTaskStarted = true;
-      }
-#ifdef HAS_TDISPLAY_LINK
-      link_send_game_name(filename);   // before emu_Init, which may block
-#endif
-      emu_Init(filename);        
-#ifdef HAS_TDISPLAY_LINK
-      // A button held during the load must not fire the instant the game starts.
-      g_menuRequest = false;
-#endif
+      startGame(filename);
     }       
     // Estava comentado no original, que rodava com o watchdog desligado na
     // IDF 3.3. Sem isto o laco do menu gira a full speed no core 0, o IDLE0
@@ -176,6 +185,13 @@ void emu_setup(void)
   // CPU com o emulador. O flush da ultima linha do quadro sai no emu_loop.
   //xTaskCreatePinnedToCore(spi_task, "spithread", 4096, NULL, 1, NULL, 0);
   //vTaskPrioritySet(NULL, tskIDLE_PRIORITY+1);     
+
+  // Boot direto no BASIC, igual a um C64 de verdade: pula o menu no
+  // power-on. F6 abre o menu depois, a qualquer momento (ver emu_loop).
+  static char emptyName[1] = {0};
+  printf("setup: startGame() -- pulando o menu, indo direto pro BASIC\n");
+  fflush(stdout);
+  startGame(emptyName);
 }
 
 void emu_loop(void)
@@ -184,6 +200,42 @@ void emu_loop(void)
   // checar um flag. O getLineBuffer() ja converte a linha anterior quando a
   // proxima e' pedida -- inclusive na volta da linha 239 para a 0.
   main_step();
+
+  // ---- Cadencia de 50 Hz -------------------------------------------------
+  // O core nao tem sincronismo proprio: oneRasterLine() roda o mais rapido
+  // que a CPU deixar. Sem cadencia o emulador oscilava de 14000 a 18800
+  // linhas/s, ou seja de 90% a 120% da velocidade real -- jogo acelerado e
+  // com ritmo tremido. Um C64 PAL faz 312 linhas por quadro a 50 Hz, entao
+  // dormimos o que sobrar de cada janela de 20 ms.
+  {
+    static int64_t nextFrame = 0;
+    static int     lineCount = 0;
+
+    if (++lineCount >= 312) {
+      lineCount = 0;
+      int64_t now = esp_timer_get_time();
+      if (nextFrame == 0) nextFrame = now;
+      nextFrame += 20000;                       // 20 ms = 50 Hz
+      int64_t wait = nextFrame - now;
+      if (wait > 1000) {
+        vTaskDelay((wait / 1000) / portTICK_PERIOD_MS);
+      } else if (wait < -200000) {
+        // Ficamos mais de 200 ms atrasados (carga de arquivo, por exemplo):
+        // nao adianta tentar recuperar o tempo perdido, ressincroniza.
+        nextFrame = now;
+      }
+
+#ifdef HAS_PS2KBD
+      // F6 abre o menu durante o jogo. Checado aqui (uma vez por quadro, ~50
+      // vezes/s) em vez de dentro de main_step() (15600 vezes/s) -- ja que
+      // e' um hotkey, nao precisa de latencia menor que a de um quadro, e
+      // emu_ReadKeys() tem um custo pequeno mas real (drena a fila do PS/2).
+      if (!menuActive() && (emu_ReadKeys() & MASK_KEY_MENU)) {
+        toggleMenu(true);
+      }
+#endif
+    }
+  }
 
   // c64_Step() emula UMA linha de raster, entao main_step() e' chamado umas
   // 15600 vezes por segundo -- delay a cada chamada mataria o desempenho.
@@ -218,9 +270,8 @@ void emu_loop(void)
     }
   }
 
-  // em 20 ms de quadro e mantem o watchdog alimentado. 50 ms em vez de 10 ms:
-  // vTaskDelay(1) custa ate' 1 ms, entao ceder a cada 10 ms tirava ~10% da CPU
-  // do emulador. O watchdog e' de 5 s, 50 ms sobra de folga.
+  // Rede de seguranca do watchdog: se o emulador estiver atrasado, a cadencia
+  // acima nunca dorme, e sem ceder CPU o IDLE0 morre de fome.
   static int64_t lastYield = 0;
   int64_t now = esp_timer_get_time();
   if (now - lastYield > 50000) {
@@ -248,6 +299,21 @@ void setup()
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== MCUME esp64 (C64) - TTGO VGA32 ===");
+
+  // Integracao com o bootloader (fg1998/esp32-bootloader): apagar o otadata
+  // faz o ESP32 voltar para a particao factory no proximo boot, em vez de
+  // recarregar este emulador. Tem que ser cedo, antes de qualquer periferico.
+  {
+    const esp_partition_t* otadata = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, NULL);
+    if (otadata) {
+      esp_partition_erase_range(otadata, 0, otadata->size);
+      Serial.println("otadata apagado: proximo boot vai para a factory");
+    } else {
+      Serial.println("AVISO: nao ha particao otadata (veja board_build.partitions)");
+    }
+    Serial.flush();
+  }
   Serial.printf("PSRAM: %s  tamanho=%u  livre=%u\n",
                 psramFound() ? "detectada" : "NAO detectada",
                 (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram());

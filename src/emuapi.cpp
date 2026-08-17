@@ -13,8 +13,6 @@ extern "C" {
 #include "video_vga.h"
 #include "ps2kbd.h"
 //#include "logo.h"
-#include "bmpjoy.h"
-#include "bmpvbar.h"
 
 #ifdef HAS_TDISPLAY_LINK
 #include "port_link.h"
@@ -69,48 +67,27 @@ static const uint16_t * logo = deflogo;
 #define CALIBRATION_FILE    "/sdcard/cal.cfg"
 
 #define MAX_FILENAME_SIZE   28
-#define MAX_MENULINES       (MKEY_L9)
-#define TEXT_HEIGHT         16
+
+// Fonte do menu: 8x8 (doublesize=false), nao mais 8x16. Com isso cabem bem
+// mais linhas na tela sem precisar rolar tanto -- MAX_MENULINES nao depende
+// mais de MKEY_L9 (era 9, resquicio do grid de toque removido).
+#define TEXT_HEIGHT         8
 #define TEXT_WIDTH          8
-#define MENU_FILE_XOFFSET   (6*TEXT_WIDTH)
+#define MAX_MENULINES       24
+#define MENU_FILE_XOFFSET   (1*TEXT_WIDTH)
 #define MENU_FILE_YOFFSET   (2*TEXT_HEIGHT)
 #define MENU_FILE_W         (MAX_FILENAME_SIZE*TEXT_WIDTH)
 #define MENU_FILE_H         (MAX_MENULINES*TEXT_HEIGHT)
 #define MENU_FILE_FGCOLOR   RGBVAL16(0xff,0xff,0xff)
 #define MENU_FILE_BGCOLOR   RGBVAL16(0x00,0x00,0x20)
-#define MENU_JOYS_YOFFSET   (12*TEXT_HEIGHT)
-#define MENU_VBAR_XOFFSET   (0*TEXT_WIDTH)
-#define MENU_VBAR_YOFFSET   (MENU_FILE_YOFFSET)
+// Rodape (status "SWAP" + dica de teclas), logo abaixo da lista.
+#define MENU_FOOTER_YOFFSET (MENU_FILE_YOFFSET + MENU_FILE_H + TEXT_HEIGHT)
 
-
-#define MKEY_L1             1
-#define MKEY_L2             2
-#define MKEY_L3             3
-#define MKEY_L4             4
-#define MKEY_L5             5
-#define MKEY_L6             6
-#define MKEY_L7             7
-#define MKEY_L8             8
-#define MKEY_L9             9
-#define MKEY_UP             20
-#define MKEY_DOWN           21
-#define MKEY_JOY            22
-
-
-const unsigned short menutouchareas[] = {
-  TAREA_XY,MENU_FILE_XOFFSET,MENU_FILE_YOFFSET,
-  TAREA_WH,MENU_FILE_W, TEXT_HEIGHT,
-  TAREA_NEW_COL,TEXT_HEIGHT,TEXT_HEIGHT,TEXT_HEIGHT,TEXT_HEIGHT,TEXT_HEIGHT,TEXT_HEIGHT,TEXT_HEIGHT,TEXT_HEIGHT,TEXT_HEIGHT,
-  
-  TAREA_XY,MENU_VBAR_XOFFSET,MENU_VBAR_YOFFSET,
-  TAREA_WH,32,48,
-  TAREA_NEW_COL, 72,72,8,40,
-    
-  TAREA_END};
-   
-const unsigned short menutouchactions[] = {
-  MKEY_L1,MKEY_L2,MKEY_L3,MKEY_L4,MKEY_L5,MKEY_L6,MKEY_L7,MKEY_L8,MKEY_L9,
-  MKEY_UP,MKEY_DOWN,ACTION_NONE,MKEY_JOY}; 
+// Os arrays menutouchareas/menutouchactions e as constantes MKEY_* foram
+// removidos: eram o grid de toque do menu (atalho numerico 1-9 + setas via
+// touchscreen). A VGA32 nao tem touch, entao nunca disparavam. O
+// captureTouchZone() em si continua (ainda serve ao teclado virtual noutra
+// tela), so' o mapa do menu saiu.
 
   
 static bool menuOn=true;
@@ -122,6 +99,14 @@ static int curFile=0;
 static int topFile=0;
 static char selection[MAX_FILENAME_SIZE+1]="";
 static uint8_t prev_zt=0; 
+
+// "._Nome" e' o arquivo de recurso (AppleDouble) que o macOS cria toda vez
+// que copia algo para um volume FAT/exFAT -- some cartao acaba cheio deles,
+// um para cada arquivo de verdade. Sem este filtro eles aparecem no menu
+// como entradas invalidas (nao carregam nada, so' confundem a lista).
+static inline bool isJunkFile(const char *name) {
+  return (name[0] == '.' && name[1] == '_');
+}
 
 static int readNbFiles(void) {
   int totalFiles = 0;
@@ -139,6 +124,7 @@ static int readNbFiles(void) {
       // no more files
       break;
     }    
+    if (isJunkFile(de->d_name)) continue;
     if (de->d_type == DT_REG) {
       totalFiles++;
     }
@@ -234,8 +220,8 @@ void toggleMenu(bool on) {
     menuOn=true;
     menuRedraw=true;  
     video.fillScreenNoDma(RGBVAL16(0x00,0x00,0x00));
-    video.drawTextNoDma(0,0, TITLE, RGBVAL16(0x00,0xff,0xff), RGBVAL16(0x00,0x00,0xff), true);  
-    video.drawSpriteNoDma(MENU_VBAR_XOFFSET,MENU_VBAR_YOFFSET,(uint16_t*)bmpvbar);
+    // false = fonte pequena (8x8), igual ao resto do menu agora.
+    video.drawTextNoDma(0,0, TITLE, RGBVAL16(0x00,0xff,0xff), RGBVAL16(0x00,0x00,0xff), false);  
   } else {
     menuOn = false;    
   }
@@ -379,21 +365,20 @@ int handleMenu(uint16_t bClick)
     if((st.st_mode & S_IFDIR) != 0)
       newPathIsDir = true;
 
-  int rx=0,ry=0,rw=0,rh=0;
-  char c = captureTouchZone(menutouchareas, menutouchactions, &rx,&ry,&rw,&rh);
-  if ( ( (bClick & MASK_JOY2_BTN) || (bClick & MASK_KEY_USER1) )  && (newPathIsDir) ) {
+  // captureTouchZone() nunca dispara nesta placa (video.isTouching() e' um
+  // stub que sempre devolve false -- nao ha touchscreen na VGA32), entao os
+  // ramos que dependiam dela (atalho numerico 1-9, setas via toque) foram
+  // removidos daqui. A navegacao inteira vem do PS/2 e do gamepad da
+  // ponte T-Display, os dois entrando em bClick via MASK_JOY2_*.
+  //
+  // ENTER (MASK_JOY2_BTN) faz tudo: se o item selecionado for pasta, entra
+  // nela; se for arquivo, roda. O F1 (USER1) so' alterna o SWAP -- antes ele
+  // tambem entrava em pasta, o que era redundante com o ENTER e confuso.
+  if ( (bClick & MASK_JOY2_BTN) && newPathIsDir ) {
       menuRedraw=true;
       strcpy(romspath,newpath);
       curFile = 0;
       nbFiles = readNbFiles();     
-  }
-  else if ( (c >= MKEY_L1) && (c <= MKEY_L9) ) {
-    if ( (topFile+(int)c-1) <= (nbFiles-1)  )
-    {
-      curFile = topFile + (int)c -1;
-      menuRedraw=true;
-     //video.drawRectNoDma( rx,ry,rw,rh, KEYBOARD_HIT_COLOR );
-    }
   }
   else if ( (bClick & MASK_JOY2_BTN) ) {
       menuRedraw=true;
@@ -405,32 +390,35 @@ int handleMenu(uint16_t bClick)
       curFile--;
     }
   }
-  else if ( (bClick & MASK_JOY2_RIGHT) || (c == MKEY_UP) ) {
-    if ((curFile-9)>=0) {
-      menuRedraw=true;
-      curFile -= 9;
-    } else if (curFile!=0) {
-      menuRedraw=true;
-      curFile--;
-    }
-  }  
   else if (bClick & MASK_JOY2_DOWN)  {
     if ((curFile<(nbFiles-1)) && (nbFiles)) {
       curFile++;
       menuRedraw=true;
     }
   }
-  else if ( (bClick & MASK_JOY2_LEFT) || (c == MKEY_DOWN) ) {
-    if ((curFile<(nbFiles-9)) && (nbFiles)) {
-      curFile += 9;
+  // LEFT/RIGHT = pagina inteira (util com muitos arquivos). Antes RIGHT
+  // pulava PRA CIMA e LEFT pulava PRA BAIXO -- herdado do layout de toque
+  // removido, mas contraintuitivo no teclado. Agora LEFT=cima, RIGHT=baixo.
+  else if (bClick & MASK_JOY2_LEFT) {
+    if ((curFile-MAX_MENULINES)>=0) {
+      menuRedraw=true;
+      curFile -= MAX_MENULINES;
+    } else if (curFile!=0) {
+      menuRedraw=true;
+      curFile=0;
+    }
+  }
+  else if (bClick & MASK_JOY2_RIGHT) {
+    if ((curFile<(nbFiles-MAX_MENULINES)) && (nbFiles)) {
+      curFile += MAX_MENULINES;
       menuRedraw=true;
     }
     else if ((curFile<(nbFiles-1)) && (nbFiles)) {
-      curFile++;
+      curFile = nbFiles-1;
       menuRedraw=true;
     }
   }
-  else if ( (bClick & MASK_KEY_USER1) || (c == MKEY_JOY) ) {
+  else if (bClick & MASK_KEY_USER1) {
     emu_SwapJoysticks(0);
     menuRedraw=true;  
   }   
@@ -446,8 +434,6 @@ int handleMenu(uint16_t bClick)
     }
     
     video.drawRectNoDma(MENU_FILE_XOFFSET,MENU_FILE_YOFFSET, MENU_FILE_W, MENU_FILE_H, MENU_FILE_BGCOLOR);
-//    if (curFile <= (MAX_MENULINES/2-1)) topFile=0;
-//    else topFile=curFile-(MAX_MENULINES/2);
     if (curFile <= (MAX_MENULINES-1)) topFile=0;
     else topFile=curFile-(MAX_MENULINES/2);
     
@@ -457,15 +443,17 @@ int handleMenu(uint16_t bClick)
       if (!de) {
         break;
       }     
+      if (isJunkFile(de->d_name)) continue;
       if ( (de->d_type == DT_REG) || ((de->d_type == DT_DIR) && (strcmp(de->d_name,".")) && (strcmp(de->d_name,"..")) ) ) {
         if (fileIndex >= topFile) {              
           if ((i+topFile) < nbFiles ) {
             if ((i+topFile)==curFile) {
-              video.drawTextNoDma(MENU_FILE_XOFFSET,i*TEXT_HEIGHT+MENU_FILE_YOFFSET, de->d_name, RGBVAL16(0xff,0xff,0x00), RGBVAL16(0xff,0x00,0x00), true);
-              strcpy(selection,de->d_name);            
+              video.drawTextNoDma(MENU_FILE_XOFFSET,i*TEXT_HEIGHT+MENU_FILE_YOFFSET, de->d_name, RGBVAL16(0xff,0xff,0x00), RGBVAL16(0xff,0x00,0x00), false);
+              strncpy(selection,de->d_name,MAX_FILENAME_SIZE);
+              selection[MAX_FILENAME_SIZE]=0;
             }
             else {
-              video.drawTextNoDma(MENU_FILE_XOFFSET,i*TEXT_HEIGHT+MENU_FILE_YOFFSET, de->d_name, MENU_FILE_FGCOLOR, MENU_FILE_BGCOLOR, true);      
+              video.drawTextNoDma(MENU_FILE_XOFFSET,i*TEXT_HEIGHT+MENU_FILE_YOFFSET, de->d_name, MENU_FILE_FGCOLOR, MENU_FILE_BGCOLOR, false);      
             }
           }
           i++; 
@@ -474,9 +462,13 @@ int handleMenu(uint16_t bClick)
       }
     }
     closedir(dir);
-    
-    video.drawSpriteNoDma(0,MENU_JOYS_YOFFSET,(uint16_t*)bmpjoy);  
-    video.drawTextNoDma(48,MENU_JOYS_YOFFSET+8, (emu_SwapJoysticks(1)?(char*)"SWAP=1":(char*)"SWAP=0"), RGBVAL16(0x00,0xff,0xff), RGBVAL16(0xff,0x00,0x00), false);
+
+    // ENTER abre pasta ou roda arquivo; F1 so' alterna o SWAP.
+    char footer[41];
+    snprintf(footer, sizeof(footer), "ENTER=abrir/rodar ARROWS=nav F1=SWAP(%d)",
+             emu_SwapJoysticks(1));
+    video.drawTextNoDma(MENU_FILE_XOFFSET, MENU_FOOTER_YOFFSET, footer,
+                        RGBVAL16(0x00,0xff,0xff), RGBVAL16(0x00,0x00,0x00), false);
 
     menuRedraw=false;     
   }
@@ -591,13 +583,12 @@ void emu_init(void)
 
 
   emu_InitJoysticks();
-  readCallibration();
-  
-  if ((video.isTouching()) || (emu_ReadKeys() & MASK_JOY2_BTN) ) {
-    callibrationInit();
-  } else  {
-    toggleMenu(true);
-  }
+
+  // Calibracao de toque removida daqui: a VGA32 nao tem touchscreen
+  // (video.isTouching() e' um stub que sempre devolve false), entao
+  // readCallibration()/callibrationInit() so' imprimiam "Callibration read
+  // error" a cada boot sem servir para nada. Quem decide o que a tela mostra
+  // no boot (BASIC direto ou o menu) e' o go.cpp, logo depois desta funcao.
 
 #ifdef HAS_I2CKBD
   uint8_t msg[7]={0,0,0,0,0,0,0};

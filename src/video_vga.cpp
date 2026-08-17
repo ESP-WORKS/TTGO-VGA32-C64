@@ -106,12 +106,17 @@ void VGA_Video::begin(void)
     Serial.flush();
     return;
   }
-  Serial.printf("[VGA] framebuffer %d bytes em %p\n", VGA_XRES * VGA_YRES, _fb);
+  Serial.printf("[VGA] %dx%d, framebuffer %d bytes em %p\n",
+                VGA_XRES, VGA_YRES, VGA_XRES * VGA_YRES, _fb);
   Serial.flush();
 
   vgaCtrl.begin();                     // pinos padrao da TTGO VGA32
   vgaCtrl.setDrawScanlineCallback(drawScanline);
+#if VGA_MODE_320x200
+  vgaCtrl.setResolution(VGA_320x200_70Hz);
+#else
   vgaCtrl.setResolution(QVGA_320x240_60Hz);
+#endif
 
   for (int i = 0; i < 64; i++)
     _rawLUT[i] = vgaCtrl.createRawPixel(RGB222((i >> 4) & 3, (i >> 2) & 3, i & 3));

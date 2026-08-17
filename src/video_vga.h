@@ -22,8 +22,22 @@
 
 #include <stdint.h>
 
+// 1 = 320x200 (padrao). O C64 so' desenha 200 linhas uteis: as 20 de borda em
+//     cima e embaixo eram decorativas. Cortar economiza 17% da conversao de
+//     linha E 17% dos memcpy de scanline na ISR da FabGL, alem de 12,8 KB de
+//     RAM interna. O BORDER do vic.cpp vira 0 sozinho, porque e' calculado a
+//     partir de VGA_YRES.
+//     Bonus: o pixel do modo 320x200 nao e' quadrado (0,833), o que compensa
+//     em parte o esticao horizontal de monitores widescreen.
+// 0 = 320x240 com as bordas.
+#define VGA_MODE_320x200 0
+
 #define VGA_XRES   320
+#if VGA_MODE_320x200
+#define VGA_YRES   200
+#else
 #define VGA_YRES   240
+#endif
 
 // Mantido: emuapi.cpp e vic_palette.h usam RGBVAL16 como tipo de cor.
 #define RGBVAL16(r,g,b)  ( (((r>>3)&0x1f)<<11) | (((g>>2)&0x3f)<<5) | (((b>>3)&0x1f)<<0) )
@@ -89,7 +103,10 @@ class VGA_Video
 // --- Instrumentacao de desempenho ---------------------------------------
 // VGA_PROFILE=1 mede o tempo gasto convertendo linhas. Custa duas leituras de
 // esp_timer por linha (15600/s), entao desligue quando nao estiver medindo.
-#define VGA_PROFILE 1
+// Agora em 0: as duas leituras de esp_timer por linha eram 31200 chamadas por
+// segundo e ja pesavam mais que o que mediam. Ponha 1 para voltar a medir
+// "conv" -- com 0 ele aparece como 0.0%, mas linhas/s e quadros/s continuam.
+#define VGA_PROFILE 0
 
 #ifdef __cplusplus
 extern "C" {
