@@ -39,6 +39,11 @@
 #define VGA_YRES   240
 #endif
 
+// Compensation horizontal: bordas laterais para reduzir área de conteúdo
+#define VGA_BORDER_WIDTH 20
+#define VGA_CONTENT_XRES (VGA_XRES - 2 * VGA_BORDER_WIDTH)  // 280 pixels para C64
+#define VGA_BORDER_COLOR RGBVAL16(0x00, 0x00, 0xFF)  // Azul
+
 // Mantido: emuapi.cpp e vic_palette.h usam RGBVAL16 como tipo de cor.
 #define RGBVAL16(r,g,b)  ( (((r>>3)&0x1f)<<11) | (((g>>2)&0x3f)<<5) | (((b>>3)&0x1f)<<0) )
 
@@ -105,16 +110,8 @@ class VGA_Video
 // esp_timer por linha (15600/s), entao desligue quando nao estiver medindo.
 // Agora em 0: as duas leituras de esp_timer por linha eram 31200 chamadas por
 // segundo e ja pesavam mais que o que mediam. Ponha 1 para voltar a medir
-// "conv" -- com 0 ele aparece como 0.0%, mas linhas/s e quadros/s continuam.
 #define VGA_PROFILE 0
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-// Devolve e ZERA os contadores acumulados desde a ultima chamada.
 void vga_get_stats(unsigned long *frames, unsigned long long *flush_us);
-#ifdef __cplusplus
-}
-#endif
+
 
 #endif // VIDEO_VGA_H

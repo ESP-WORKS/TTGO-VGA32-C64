@@ -44,8 +44,7 @@ static void IRAM_ATTR drawScanline(void *arg, uint8_t *dest, int scanLine)
 
 // ---------------------------------------------------------------------------
 // Converte o scratch para a linha do framebuffer aplicando o swizzle x^2.
-// Dentro de cada palavra de 32 bits alinhada isso e' a ordem de bytes
-// { px2, px3, px0, px1 }: montamos a palavra e gastamos 1 store por 4 pixels.
+// Com compensação horizontal: reduz conteúdo de 320 para 280 pixels (20px bordas laterais).
 // ---------------------------------------------------------------------------
 static void IRAM_ATTR flushLine(int y)
 {
@@ -55,25 +54,28 @@ static void IRAM_ATTR flushLine(int y)
   int64_t t0 = esp_timer_get_time();
 #endif
 
-  uint32_t       *dst = (uint32_t *)(_fb + y * VGA_XRES);
-  const uint32_t *src = (const uint32_t *)lineScratch;  // 2 pixels por palavra
   const uint8_t  *lut = _rawLUT;
+  uint8_t *fb_line = _fb + y * VGA_XRES;
+  uint8_t borderRaw = lut[vga_rgb565to6(VGA_BORDER_COLOR) & 0x3F];
 
-  // O scratch e' uint16_t por pixel (so' os 6 bits baixos importam). Lendo de
-  // 32 em 32 bits pegamos DOIS pixels por acesso: metade das leituras que a
-  // versao anterior fazia.
-  //
-  // O destino precisa do swizzle x^2, que dentro de uma palavra alinhada e' a
-  // ordem de bytes { px2, px3, px0, px1 }. Montamos a palavra e gravamos de
-  // uma vez: 1 store a cada 4 pixels.
-  for (int x = 0; x < VGA_XRES; x += 4) {
-    uint32_t a = *src++;                    // px0 | px1 << 16
-    uint32_t b = *src++;                    // px2 | px3 << 16
-    uint32_t p0 = lut[a & 0x3F];
-    uint32_t p1 = lut[(a >> 16) & 0x3F];
-    uint32_t p2 = lut[b & 0x3F];
-    uint32_t p3 = lut[(b >> 16) & 0x3F];
-    *dst++ = p2 | (p3 << 8) | (p0 << 16) | (p1 << 24);
+  // Left border: 20 pixels
+  for (int x = 0; x < VGA_BORDER_WIDTH; x++) {
+    fb_line[(x ^ 2)] = borderRaw;
+  }
+
+  // Center: scale/compress 320 -> VGA_CONTENT_XRES (280)
+  // Mapeia conteúdo do C64 (0..319) para área comprimida (20..299)
+  for (int dx = 0; dx < VGA_CONTENT_XRES; dx++) {
+    int src_x = (dx * VGA_XRES) / VGA_CONTENT_XRES;  // map compressed coord -> source
+    if (src_x >= VGA_XRES) src_x = VGA_XRES - 1;
+    uint8_t raw = lut[lineScratch[src_x] & 0x3F];
+    int dst_x = VGA_BORDER_WIDTH + dx;
+    fb_line[(dst_x ^ 2)] = raw;
+  }
+
+  // Right border: 20 pixels
+  for (int x = VGA_XRES - VGA_BORDER_WIDTH; x < VGA_XRES; x++) {
+    fb_line[(x ^ 2)] = borderRaw;
   }
 
 #if VGA_PROFILE
@@ -121,11 +123,21 @@ void VGA_Video::begin(void)
   for (int i = 0; i < 64; i++)
     _rawLUT[i] = vgaCtrl.createRawPixel(RGB222((i >> 4) & 3, (i >> 2) & 3, i & 3));
 
+  // Fundo inicial com bordas azuis
   memset(_fb, _rawLUT[0], VGA_XRES * VGA_YRES);
+  uint8_t borderRaw = _rawLUT[vga_rgb565to6(VGA_BORDER_COLOR) & 0x3F];
+  for (int y = 0; y < VGA_YRES; y++) {
+    for (int x = 0; x < VGA_BORDER_WIDTH; x++)
+      _fb[y * VGA_XRES + (x ^ 2)] = borderRaw;
+    for (int x = VGA_XRES - VGA_BORDER_WIDTH; x < VGA_XRES; x++)
+      _fb[y * VGA_XRES + (x ^ 2)] = borderRaw;
+  }
+
   memset(lineScratch, 0, sizeof(lineScratch));
   vgaReady = true;
 
-  Serial.printf("[VGA] pronto. heap interno livre=%u\n",
+  Serial.printf("[VGA] pronto. Compensacao horizontal: 320->280px com 20px bordas azuis.\n");
+  Serial.printf("[VGA] heap interno livre=%u\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   Serial.flush();
 }
