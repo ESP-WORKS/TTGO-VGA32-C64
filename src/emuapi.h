@@ -33,6 +33,9 @@
 #define SD_FREQ_KHZ 4000
 
 #define emu_Init(ROM) {c64_Init(); c64_Start(ROM);}
+// Reset do C64 emulado, sem tocar no arquivo carregado: so' o c64_Init()
+// (PLA, CIAs, VIC, CPU). Equivale ao reset de um C64 real -- volta ao BASIC.
+#define emu_Reset()   {c64_Init();}
 #define emu_Step() {c64_Step();}
 #define emu_Input(x) {c64_Input(x);}
 
@@ -115,6 +118,7 @@ const unsigned short i2ckeys[] = {
 #define MASK_JOY1_BTN   0x1000
 #define MASK_KEY_USER4  0x2000
 #define MASK_KEY_MENU   0x4000  // F6 no PS/2: reabre o menu durante o jogo
+#define MASK_KEY_RESET  0x8000  // F5 no PS/2: reseta o C64 emulado (volta ao BASIC)
 
 
 extern void emu_init(void);
@@ -135,6 +139,7 @@ extern int emu_LoadFileSeek(char * filename, char * buf, int size, int seek);
 extern void emu_InitJoysticks(void);
 extern int emu_SwapJoysticks(int statusOnly);
 extern unsigned short emu_DebounceLocalKeys(void);
+extern unsigned short emu_GetMenuKeys(void);
 extern int emu_ReadKeys(void);
 extern int emu_GetPad(void);
 extern int emu_ReadAnalogJoyX(int min, int max);

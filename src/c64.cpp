@@ -51,9 +51,10 @@ static void oneRasterLine(void) {
 
 const uint32_t ascii2scan[] = {
  //0 1 2 3 4 5 6 7 8 9 A B C D E F
-   0,0,0,0,0,0,0,0,0,0,0,0,0,0x28,0,0, // return
- //     17:down                                                     29:right
-   0x00,0x51,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x4f,0x00,0x00,
+ //     3=RUN/STOP (mapeado como ESC no PS/2; 0x29 -> row7/col7 na matriz)
+   0,0,0,0x29,0,0,0,0,0,0,0,0,0,0x28,0,0, // return
+ //     17:down                    20=DEL/INST (Backspace)                  29:right
+   0x00,0x51,0x00,0x00,0x2a,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x4f,0x00,0x00,
    //sp  !       "     #     $      %      &      '     (        )   *    +    ,    -    .    / 
    0x2c,0x201e,0x201f,0x2020,0x2021,0x2022,0x2023,0x2024,0x2025,0x2026,0x55,0x57,0x36,0x56,0x37,0x54,
    //0  1    2    3    4    5    6    7    8    9    :    ;    <      =    >      ?
@@ -63,7 +64,10 @@ const uint32_t ascii2scan[] = {
    //P  Q    R    S    T    U    V    W    X    Y    Z    [      \     ]     ^    _  
    0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x2026,0x31,0x2027,0x00,0x00,
    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // ' a b c d e f g h i j k l m n o
-   0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x49,0, // p q r s t u v w x y z { | } ~ DEL
+ //p q r s t u v w x y z { | } ~ 127=DEL/INST (Backspace do PS/2 -> 20 no
+ //                               nosso mapeamento; mas manter 127 tambem
+ //                               resolve se algum caminho passar por 127)
+   0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x49,0x2a, // 112-127
  //up left arr      133:f1   f2   f3   f4   f5   f6   f7   f8 
    75,78,0x00,0x00,0x00,0x3a,0x3b,0x3c,0x3d,0x3e,0x3f,0x40,0x41,0x00,0x00,0x00,  // 128-143
  //     145:up                                                      157:left
@@ -157,8 +161,11 @@ static void pushStringToTextEntry(char * text) {
    ficar ativa enquanto o dedo estiver nela. Por isso o PS/2 (e o botao B/Y do
    gamepad) escrevem aqui, em paralelo com o kbdData.
 
-   Devolve o scancode, ou 0 quando nada esta segurado. */
-static inline uint8_t heldScancode(void) {
+   Devolve o valor COMPLETO da tabela ascii2scan[] (nao truncado): o byte
+   baixo e' o scancode e o bit 0x2000 e' o flag de SHIFT. Caracteres como " #
+   $ ( ) e as setas de cursor dependem do shift -- descarta-lo (o antigo
+   & 0xFF) fazia o " virar ', o Backspace nao apagar, etc. 0 = nada segurado. */
+static inline uint16_t heldScancode(void) {
   int k = 0;
 #ifdef HAS_PS2KBD
   k = ps2kbd_get_held_ascii();
@@ -167,8 +174,22 @@ static inline uint8_t heldScancode(void) {
   if (!k) k = link_get_stkey();
 #endif
   if (k <= 0 || k >= (int)(sizeof(ascii2scan)/sizeof(ascii2scan[0]))) return 0;
-  return (uint8_t)(ascii2scan[k] & 0xFF);
+
+  uint16_t sc = (uint16_t)ascii2scan[k];
+  // TRACE TEMPORARIO: imprime uma vez por transicao, nao a cada leitura da
+  // matriz (~15600/s). Sem esta guarda o serial vira lixo.
+  static int lastK = 0;
+  if (k != lastK) {
+    lastK = k;
+    if (k) printf("[held] ascii=%d -> scancode=$%04X\n", k, sc);
+  }
+  return sc;
 }
+
+// keymatrixmap[][] usa 0xff/0xfe como "linhas" do shift esquerdo/direito.
+// Quando a entrada da tabela tem o flag 0x2000, precisamos pressionar o
+// SHIFT junto com a tecla -- senao o C64 ve a tecla sem shift.
+#define HELD_SHIFT_ROW 0xff   /* shift esquerdo em keymatrixmap */
 #endif
 
 
@@ -194,10 +215,15 @@ uint8_t cia1PORTA(void) {
 
 #ifdef HAS_HELD_KEYS
   {
-    uint8_t lk = heldScancode();
+    uint16_t hk = heldScancode();
+    uint8_t  lk = hk & 0xFF;
     if (lk) {
       uint8_t lf = ~cpu.cia1.R[0x01] & cpu.cia1.R[0x03];
       if (keymatrixmap[1][lk] & lf) v &= ~keymatrixmap[0][lk];
+      // Se a tecla precisa de SHIFT (flag 0x2000), pressiona o shift junto.
+      if (hk & 0x2000) {
+        if (keymatrixmap[1][HELD_SHIFT_ROW] & lf) v &= ~keymatrixmap[0][HELD_SHIFT_ROW];
+      }
     }
   }
 #endif
@@ -253,10 +279,14 @@ uint8_t cia1PORTB(void) {
 
 #ifdef HAS_HELD_KEYS
   {
-    uint8_t lk = heldScancode();
+    uint16_t hk = heldScancode();
+    uint8_t  lk = hk & 0xFF;
     if (lk) {
       uint8_t lf = ~cpu.cia1.R[0x00] & cpu.cia1.R[0x02];
       if (keymatrixmap[0][lk] & lf) v &= ~keymatrixmap[1][lk];
+      if (hk & 0x2000) {
+        if (keymatrixmap[0][HELD_SHIFT_ROW] & lf) v &= ~keymatrixmap[1][HELD_SHIFT_ROW];
+      }
     }
   }
 #endif

@@ -51,12 +51,23 @@ static void input_task(void *args)
 #ifdef HAS_TDISPLAY_LINK
     link_poll();   // core 0, a few bytes out of a FIFO: costs nothing
 #endif
-    if ( ((emu_ReadKeys() & (MASK_KEY_USER1+MASK_KEY_USER2)) == (MASK_KEY_USER1+MASK_KEY_USER2))
-      || (emu_ReadKeys() & MASK_KEY_USER4 ) )
-    {  
-      printf("rebooting\n");
-      esp_restart();    
-    }
+    // O combo USER1+USER2 / USER4 reinicia o ESP32 (integracao com o
+    // bootloader). Foi desabilitado porque:
+    //  1) Os botoes fisicos USER1..4 nao existem nesta placa (GPIO 35/34/39/
+    //     36 ficam flutuando).
+    //  2) O F1 do PS/2 injeta MASK_KEY_USER1. Se algum ruido do link
+    //     T-Display fizer USER2 aparecer no mesmo quadro, o combo dispara e
+    //     a placa reseta -- sintoma que aparecia como "apertei F6 e a placa
+    //     resetou antes de abrir o menu".
+    // Para voltar ao bootloader, use a botao de reset fisico do ESP32 ou
+    // remova via serial. Se precisar do reset por combo, escolha outras
+    // teclas (por ex. VK_ESCAPE apertado por 2 s).
+    //if ( ((emu_ReadKeys() & (MASK_KEY_USER1+MASK_KEY_USER2)) == (MASK_KEY_USER1+MASK_KEY_USER2))
+    //  || (emu_ReadKeys() & MASK_KEY_USER4 ) )
+    //{  
+    //  printf("rebooting\n");
+    //  esp_restart();    
+    //}
 
     uint16_t bClick = emu_DebounceLocalKeys();
     if (bClick & MASK_KEY_USER2) { 
@@ -110,7 +121,9 @@ static void main_step() {
     // ROM picker.
     link_poll();
 #endif
-    uint16_t bClick = emu_DebounceLocalKeys();
+    // emu_GetMenuKeys (nao ...DebounceLocalKeys): as setas do PS/2 vem por
+    // EVENTO com auto-repeat, senao segurar a seta so' anda 1 item.
+    uint16_t bClick = emu_GetMenuKeys();
     int action = handleMenu(bClick);
     char * filename = menuSelection();
     if (action == ACTION_RUN) {
@@ -226,12 +239,26 @@ void emu_loop(void)
       }
 
 #ifdef HAS_PS2KBD
-      // F6 abre o menu durante o jogo. Checado aqui (uma vez por quadro, ~50
-      // vezes/s) em vez de dentro de main_step() (15600 vezes/s) -- ja que
-      // e' um hotkey, nao precisa de latencia menor que a de um quadro, e
-      // emu_ReadKeys() tem um custo pequeno mas real (drena a fila do PS/2).
-      if (!menuActive() && (emu_ReadKeys() & MASK_KEY_MENU)) {
-        toggleMenu(true);
+      // F6 abre o menu durante o jogo, F5 reseta o C64. Checados aqui (uma
+      // vez por quadro, ~50 vezes/s) em vez de dentro de main_step() (15600
+      // vezes/s) -- e' hotkey, nao precisa de latencia sub-quadro.
+      //
+      // Deteccao POR BORDA: guardamos o estado do quadro anterior e so'
+      // disparamos na transicao solto->apertado. Sem isso, a mesma tecla
+      // pressionada por 100 ms dispara em varios quadros seguidos, e F5
+      // (reset) chegava a rodar 5-6 vezes num toque so'.
+      if (!menuActive()) {
+        static uint16_t prevKeys = 0;
+        uint16_t keys = emu_ReadKeys();
+        uint16_t edge = keys & ~prevKeys;
+        prevKeys = keys;
+
+        if (edge & MASK_KEY_MENU) {
+          toggleMenu(true);
+        } else if (edge & MASK_KEY_RESET) {
+          // F5: reseta o C64 (volta ao BASIC), mantendo o que estiver na RAM.
+          emu_Reset();
+        }
       }
 #endif
     }

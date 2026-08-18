@@ -26,6 +26,11 @@ int  ps2kbd_read_ascii(void);
 // teclado). Sem isto o seletor de ROMs nao responde ao PS/2.
 unsigned short ps2kbd_get_mask(void);
 
+// Eventos de navegacao (setas/ENTER) acumulados como MASK_JOY2_*, drenados a
+// cada chamada. O menu usa isto em vez de ps2kbd_get_mask() para que segurar
+// a seta repita no ritmo do auto-repeat, em vez de andar so' 1 por toque.
+unsigned short ps2kbd_get_events(void);
+
 // ASCII da tecla segurada agora (0 = nenhuma). Injetada direto na matriz do
 // C64, o que faz o teclado funcionar em jogo e nao so' para digitar.
 int ps2kbd_get_held_ascii(void);

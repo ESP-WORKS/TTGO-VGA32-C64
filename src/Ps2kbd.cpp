@@ -4,7 +4,7 @@
 
 // 1 = imprime cada tecla recebida no serial. Use para confirmar se o teclado
 // esta chegando antes de procurar problema no mapeamento.
-#define PS2_TRACE 0
+#define PS2_TRACE 1   // TEMPORARIO: veja no serial o vk/ascii de cada tecla; volte a 0 depois
 
 // Teclado PS/2 da TTGO VGA32 via FabGL (preset KeyboardPort0 = CLK 33 / DAT 32).
 //
@@ -27,11 +27,23 @@
 #define M_JOY2_BTN   0x0010
 #define M_KEY_USER1  0x0020   // dispara a macro LOAD""+RUN no c64_Input()
 #define M_KEY_MENU   0x4000   // F6: reabre o menu durante o jogo
+#define M_KEY_RESET  0x8000   // F5: reseta o C64 emulado
 
 static fabgl::PS2Controller ps2;
 static bool     kbdReady = false;
-static uint16_t s_mask   = 0;
+static uint16_t s_mask   = 0;   // ESTADO das teclas (nivel): para o jogo
+static uint16_t s_events = 0;   // EVENTOS 'down' acumulados: para o menu
 static uint8_t  s_held   = 0;   // ASCII da tecla atualmente SEGURADA
+
+// Por que dois acumuladores:
+//   - O jogo quer NIVEL: seta segurada = direcao mantida. Isso e' s_mask.
+//   - O menu quer EVENTO: cada pressionar = um passo, e segurar deve repetir
+//     no ritmo do auto-repeat do teclado. Isso e' s_events, que junta cada
+//     'down' (inclusive os repeats que a FabGL gera) e e' esvaziado por
+//     ps2kbd_get_events(). Antes o menu usava o s_mask de nivel com
+//     deteccao de borda, e como o nivel ficava preso em 1 enquanto a tecla
+//     estava pressionada, a borda so' acontecia uma vez -- dai "apertar 5x
+//     para andar 1".
 
 #define ASCII_QUEUE_SIZE 16
 static uint8_t asciiQ[ASCII_QUEUE_SIZE];
@@ -48,6 +60,17 @@ static inline int qPop(void) {
   return c;
 }
 
+// Teclas que servem para NAVEGAR (setas + ENTER). No menu elas movem a
+// selecao; no jogo NAO devem virar joystick -- viram cursor, pelo caminho do
+// heldScancode() em c64.cpp (codigos 17/29/145/157). Por isso elas entram
+// so' em s_events (consumido pelo menu) e nunca em s_mask (consumido pelo
+// jogo). Ver ps2kbd_poll().
+//
+// Decisao de projeto (agosto/2026): tratamos o teclado como o de um C64
+// real. No C64 as setas movem o CURSOR, nao um joystick -- o joystick era um
+// periferico separado. Entao nenhuma tecla vira direcao de joystick. Se um
+// dia quiser jogar com o teclado, e' aqui que se religa (mapear WASD ou as
+// setas de volta para MASK_JOY2_* em s_mask).
 static uint16_t maskOf(fabgl::VirtualKey vk) {
   switch (vk) {
     case fabgl::VK_UP:     return M_JOY2_UP;
@@ -63,6 +86,10 @@ static uint16_t maskOf(fabgl::VirtualKey vk) {
     case fabgl::VK_F1:     return M_KEY_USER1;
     // F6 reabre o menu durante o jogo (o C64 sozinho nao teria essa tecla;
     // e' so' um atalho nosso). Consumido em go.cpp, uma vez por quadro.
+    // F5 reseta o C64 emulado (volta ao BASIC), como o reset de um C64 real.
+    // Nao reinicia o ESP32 -- isso continua no USER4 (GPIO36). Consumido em
+    // go.cpp, uma vez por quadro.
+    case fabgl::VK_F5:     return M_KEY_RESET;
     case fabgl::VK_F6:     return M_KEY_MENU;
     case fabgl::VK_KP_ENTER:return M_JOY2_BTN;
     default:               return 0;
@@ -98,17 +125,47 @@ static void ps2kbd_poll(void)
 #endif
     uint16_t m = maskOf(vk);
     if (m) {
-      if (down) s_mask |= m; else s_mask &= ~m;
+      // Dois destinos, com criterio: as teclas de NAVEGACAO (setas + ENTER)
+      // vao SO' para s_events (consumido pelo menu). No jogo elas viram
+      // cursor, nao joystick -- tratamos o teclado como o de um C64 real.
+      //
+      // Ja' as teclas de FUNCAO (F1/F5/F6) precisam ir para s_mask, porque
+      // sao hotkeys checados durante o jogo por emu_ReadKeys() (F1=LOAD""+
+      // RUN, F5=reset, F6=menu). Sem isso as F* silenciosamente pararam de
+      // funcionar quando separei as setas do s_mask na rodada passada.
+      const uint16_t navBits = M_JOY2_UP | M_JOY2_DOWN | M_JOY2_LEFT |
+                               M_JOY2_RIGHT | M_JOY2_BTN;
+      if (down) {
+        s_events |= m;                          // menu ve tudo (nav e F*)
+        if ((m & navBits) == 0) s_mask |= m;    // jogo so' recebe hotkeys
+      } else {
+        if ((m & navBits) == 0) s_mask &= ~m;   // libera hotkey ao soltar
+      }
     }
     int c = kb->virtualKeyToASCII(vk);
     {
-      // As setas nao tem ASCII (virtualKeyToASCII devolve -1), mas o C64 tem
-      // codigos proprios de cursor -- e o ascii2scan[] do c64.cpp os mapeia.
+      // Varias teclas nao tem (ou tem o ASCII "errado" para o C64). Mapeamos
+      // pelo VirtualKey, que e' inequivoco, para os codigos que a tabela
+      // ascii2scan[] do c64.cpp entende:
+      //   - setas -> codigos de cursor do C64 (17/29/145/157)
+      //   - RETURN -> 13 (a FabGL as vezes devolve 10/'\n', que a tabela nao
+      //     tem, e ai o Enter "sumia" ou caia noutra tecla)
+      //   - BACKSPACE -> 20, o DEL/INST do C64 (ascii2scan[20]=0x49); a FabGL
+      //     devolve 8, que na tabela e' 0 = nada
       switch (vk) {
-        case fabgl::VK_UP:    c = 145; break;
-        case fabgl::VK_DOWN:  c = 17;  break;
-        case fabgl::VK_LEFT:  c = 157; break;
-        case fabgl::VK_RIGHT: c = 29;  break;
+        case fabgl::VK_UP:        c = 145; break;
+        case fabgl::VK_DOWN:      c = 17;  break;
+        case fabgl::VK_LEFT:      c = 157; break;
+        case fabgl::VK_RIGHT:     c = 29;  break;
+        case fabgl::VK_RETURN:
+        case fabgl::VK_KP_ENTER:  c = 13;  break;
+        case fabgl::VK_BACKSPACE: c = 20;  break;   // DEL/INST do C64
+        case fabgl::VK_DELETE:    c = 20;  break;
+        case fabgl::VK_HOME:      c = 19;  break;   // CLR/HOME
+        // ESC do PS/2 = RUN/STOP do C64. Sem isto nao existe RUN/STOP
+        // funcional (a tecla nao esta no PS/2 padrao). E' a tecla que
+        // interrompe programas BASIC e sai de muitos loaders.
+        case fabgl::VK_ESCAPE:    c = 3;   break;
         default: break;
       }
 
@@ -141,6 +198,13 @@ void ps2kbd_begin(void)
   ps2.begin(PS2Preset::KeyboardPort0, KbdMode::CreateVirtualKeysQueue);
   fabgl::Keyboard *kb = ps2.keyboard();
   if (kb) {
+    // Layout US DE PROPOSITO, mesmo com teclado fisico ABNT2. O C64 real e'
+    // um teclado americano: nao tem c-cedilha nem acentos, e simbolos como "
+    // # $ ( ) saem com shift+numero no arranjo US. Mapear o ABNT2 fielmente
+    // deixaria o usuario sem teclas que o C64 tem e com teclas que o C64 nao
+    // tem. A troca: alguns simbolos saem numa tecla fisica diferente da
+    // serigrafia do seu teclado (ex.: shift+2 = " no US, nao @). E' o
+    // comportamento correto para um emulador de C64.
     kb->setLayout(&fabgl::USLayout);
     kbdReady = true;
   }
@@ -162,7 +226,21 @@ int ps2kbd_read_ascii(void)
 uint16_t ps2kbd_get_mask(void)
 {
   ps2kbd_poll();
+  // Devolve o estado de nivel das HOTKEYS (F1/F5/F6). As setas nao entram
+  // aqui de proposito -- para elas usar ps2kbd_get_events(), que o menu
+  // consome. Ver ps2kbd_poll() para a separacao.
   return s_mask;
+}
+
+// Eventos de navegacao acumulados desde a ultima chamada -- e ZERA. Cada
+// pressionar (e cada auto-repeat) conta uma vez. E' o que o menu deve usar
+// para as setas/ENTER, em vez do s_mask de nivel.
+uint16_t ps2kbd_get_events(void)
+{
+  ps2kbd_poll();
+  uint16_t e = s_events;
+  s_events = 0;
+  return e;
 }
 
 

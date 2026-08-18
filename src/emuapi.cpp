@@ -876,9 +876,9 @@ int emu_ReadKeys(void)
   j1 |= link_get_mask();
 #endif
 #ifdef HAS_PS2KBD
-  // Setas e Enter do PS/2. Sem isto o seletor de ROMs nao responde ao teclado:
-  // o menu le emu_ReadKeys(), e emu_ReadI2CKeyboard() so' e' chamado pelo
-  // c64_Input(), que roda apenas com um jogo carregado.
+  // Le hotkeys do PS/2 (F1/F5/F6). As setas ja' NAO estao aqui: ficaram so'
+  // em s_events, consumido pelo menu -- no jogo elas viram cursor, nao
+  // joystick. Ver ps2kbd_poll() em Ps2kbd.cpp para a separacao.
   j1 |= ps2kbd_get_mask();
 #endif
 
@@ -891,12 +891,19 @@ int emu_ReadKeys(void)
     retval = ((j2 << 8) | j1);
   }
 
-  if (gpio_get_level((gpio_num_t)PIN_KEY_USER1) == 0 ) retval |= MASK_KEY_USER1;
+  // Botoes fisicos USER1..4 NAO existem na TTGO VGA32. Os GPIOs 35/34/39/36
+  // ficam flutuando (sem pull-up ligado no emu_InitJoysticks), e leitura
+  // ocasional voltava 0 = "botao pressionado" fantasma. Quando USER1 + USER2
+  // "batiam" ao mesmo tempo, o input_task interpretava como o combo de reset
+  // e reiniciava a placa -- sintoma classico: apertar F1 e a placa reseta.
+  // O F1 do PS/2 ja injeta MASK_KEY_USER1 direto em j1 acima, entao nao
+  // perdemos o comando de LOAD"".
+  //if (gpio_get_level((gpio_num_t)PIN_KEY_USER1) == 0 ) retval |= MASK_KEY_USER1;
 #ifndef HAS_TDISPLAY_LINK
-  if (gpio_get_level((gpio_num_t)PIN_KEY_USER2) == 0 ) retval |= MASK_KEY_USER2;
+  //if (gpio_get_level((gpio_num_t)PIN_KEY_USER2) == 0 ) retval |= MASK_KEY_USER2;
 #endif
-  if (gpio_get_level((gpio_num_t)PIN_KEY_USER3) == 0 ) retval |= MASK_KEY_USER3;
-  if (gpio_get_level((gpio_num_t)PIN_KEY_USER4) == 0 ) retval |= MASK_KEY_USER4;
+  //if (gpio_get_level((gpio_num_t)PIN_KEY_USER3) == 0 ) retval |= MASK_KEY_USER3;
+  //if (gpio_get_level((gpio_num_t)PIN_KEY_USER4) == 0 ) retval |= MASK_KEY_USER4;
 
   //printf("%d\n",retval);   
   return (retval);
@@ -909,6 +916,47 @@ unsigned short emu_DebounceLocalKeys(void)
   bLastState = bCurState;
 
   return (bClick);
+}
+
+// Leitura de teclas ESPECIFICA do menu.
+//
+// O problema que isto resolve: emu_DebounceLocalKeys() faz deteccao de borda
+// (bCurState & ~bLastState). Para os botoes fisicos (USER1..4) e para o
+// gamepad da T-Display isso e' certo -- um toque = uma acao. Mas para as
+// setas do PS/2 o s_mask fica em NIVEL enquanto a tecla esta pressionada,
+// entao a borda so' acontece uma vez: segurar a seta nao repetia, e ate'
+// mover um item exigia soltar e reapertar varias vezes ("apertar 5x").
+//
+// Aqui as setas/ENTER vem de ps2kbd_get_events() (cada 'down', incluindo os
+// auto-repeats do teclado, conta uma vez) e o resto continua por borda.
+unsigned short emu_GetMenuKeys(void)
+{
+  uint16_t bClick = 0;
+
+#ifdef HAS_PS2KBD
+  // Eventos do teclado: setas (nav) e ENTER (MASK_JOY2_BTN). Ja' vem
+  // "pulsados", entao entram direto, sem passar pelo edge-detect.
+  bClick |= ps2kbd_get_events();
+#endif
+
+  // Botoes fisicos e gamepad continuam por borda. Mascaramos as setas e o
+  // ENTER do estado de nivel para nao competir com os eventos do PS/2 acima
+  // (o gamepad da T-Display, se usado, ainda dispara por estes bits via
+  // link_get_mask -> s de nivel; para ele a borda esta correta).
+  uint16_t bCurState = emu_ReadKeys();
+  uint16_t levelClick = bCurState & ~bLastState;
+  bLastState = bCurState;
+
+#ifdef HAS_PS2KBD
+  // Evita contagem dupla das setas/ENTER quando vieram do PS/2: se o evento
+  // ja' pegou, ignoramos a borda de nivel dos mesmos bits nesta leitura.
+  const uint16_t navBits = MASK_JOY2_UP|MASK_JOY2_DOWN|MASK_JOY2_LEFT|
+                           MASK_JOY2_RIGHT|MASK_JOY2_BTN;
+  if (bClick & navBits) levelClick &= ~navBits;
+#endif
+
+  bClick |= levelClick;
+  return bClick;
 }
 
 

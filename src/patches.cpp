@@ -46,178 +46,276 @@ extern char * menuSelection(void);
 
 
 /* ===========================================================================
-   Suporte a .T64 (Tape containers for C64s)
+   Suporte a .D64 (imagem do disquete 5.25" do 1541)
 
-   Layout exato conforme T64.TXT (Peter Schepers, revisao 1.5):
-   https://ist.uwaterloo.ca/~schepers/formats/T64.TXT
+   Um .d64 e' o dump byte a byte de um disquete de 35 trilhas do 1541. Nao
+   tem cabecalho -- e' 174848 bytes de setores concatenados em ordem, e a
+   geometria e' fixa (nao esta no arquivo):
 
-     offset 0x00-0x02 : assinatura "C64" (ASCII)
-     offset 0x24-0x25 : numero de entradas USADAS no diretorio (low/high)
-     offset 0x40 + n*32 : entradas de diretorio, 32 bytes cada
-       +0x00 : tipo C64s (0 = livre, 1 = arquivo normal -- so' isto suportamos)
-       +0x01 : tipo 1541 (na pratica, != 0 significa PRG)
-       +0x02-03 : endereco de carga (load address)
-       +0x04-05 : endereco final -- NAO CONFIAVEL. Ha' T64s antigos gerados
-                  pelo CONV64 com bug conhecido que grava $C3C6 fixo aqui
-                  independente do tamanho real. Nunca usamos este campo.
-       +0x08-0B : offset do arquivo dentro do container (32 bits, low/high)
-       +0x10-1F : nome do arquivo, 16 bytes, ASCII, padded com espaco ($20,
-                  nao $A0 como no disco -- por isso nomes T64 nao podem ter
-                  espaco no final)
+     trilhas 1-17  : 21 setores cada  (0..20)
+     trilhas 18-24 : 19 setores cada
+     trilhas 25-30 : 18 setores cada
+     trilhas 31-35 : 17 setores cada
+     total: 683 setores * 256 bytes = 174848 bytes
 
-   Como o formato nao guarda o tamanho de cada arquivo, ele e' inferido pela
-   diferenca entre o offset desta entrada e o offset da proxima entrada mais
-   proxima no arquivo (ou o fim do arquivo, para a ultima). Por isso lemos o
-   diretorio inteiro antes de decidir o tamanho de qualquer entrada.
+   Alguns .d64 tem 175531 bytes (com "error bytes" no fim) -- ignoramos, o
+   miolo dos primeiros 174848 bytes e' o mesmo.
 
-   Sessao T64: LOAD"" com um .t64 selecionado no menu abre o container e
-   carrega a primeira entrada valida. Enquanto esse container continuar
-   "aberto" (s_t64Container nao vazio), um LOAD"NOME" subsequente procura
-   NOME dentro do MESMO container em vez de tentar abrir "NOME" como arquivo
-   solto no cartao -- e' o padrao que jogos multi-parte usam (ex.: o loader
-   faz LOAD"PART2",8,1 depois do primeiro LOAD""). LOAD"*" carrega a proxima
-   entrada em ordem, tambem um idioma comum em loaders C64.
+   Estrutura relevante:
+     trilha 18, setor 0  : BAM + nome do disco (nao lemos o BAM aqui)
+     trilha 18, setor 1  : primeiro setor do diretorio
+
+   Diretorio (blocos de 256 bytes, encadeados):
+     +0-1  : trilha e setor do PROXIMO bloco (00 00 se fim)
+     +2..  : 8 entradas de 32 bytes cada:
+       +0x02 : tipo do arquivo (bit 7 = "closed"; bits 0-3: 0=DEL, 1=SEQ,
+               2=PRG, 3=USR, 4=REL). So' aceitamos PRG (0x82 = fechado+PRG).
+       +0x03 : trilha do primeiro setor do arquivo
+       +0x04 : setor do primeiro setor do arquivo
+       +0x05-0x14 : nome, 16 bytes em PETSCII, padded com $A0
+       +0x1E-0x1F : tamanho em blocos de 254 bytes (aproximado)
+
+   Cada bloco de arquivo (256 bytes) tem 2 bytes de link no inicio:
+     +0-1 : proxima trilha/setor. Se trilha == 0, o setor indica quantos
+            bytes DESTE bloco sao validos (o resto e' padding).
+     +2-255 : dados uteis (254 bytes por bloco cheio).
+
+   O primeiro bloco tem, alem dos 2 bytes de link, o load address nos dois
+   bytes seguintes (offsets 2 e 3), igual a um PRG. Ou seja, os "dados" do
+   PRG comecam realmente no offset 4 do primeiro bloco.
    =========================================================================== */
 
-#define T64_DIR_ENTRY_SIZE  32
-#define T64_DIR_START       0x40
-#define T64_MAX_ENTRIES     64    /* qualquer T64 real cabe nisso; sem alloc dinamico */
+#define D64_SECTOR_SIZE     256
+#define D64_STD_SIZE        174848
+#define D64_DIR_TRACK       18
+#define D64_DIR_FIRST_SECT  1
+#define D64_ENTRIES_PER_BLK 8
+#define D64_ENTRY_SIZE      32
+#define D64_MAX_ENTRIES     144   /* 18 blocos * 8 entradas, cabe o dir cheio */
 
 typedef struct {
-  uint16_t loadAddr;
-  uint32_t fileOffset;
+  uint8_t  firstTrack;
+  uint8_t  firstSector;
+  uint16_t sizeInBlocks;
   char     name[17];
-} T64Entry;
+} D64Entry;
 
-static char s_t64Container[64] = "";   /* "" = nenhuma sessao T64 ativa */
-static int  s_t64NextIndex = 0;
+static char s_d64Container[64] = "";   /* "" = nenhuma sessao D64 ativa */
 
-static int t64IsT64(const char *fname) {
+static int d64IsD64(const char *fname) {
   int len = strlen(fname);
   if (len < 4) return 0;
   const char *ext = fname + len - 4;
   return (ext[0] == '.' &&
-          (ext[1] == 't' || ext[1] == 'T') &&
+          (ext[1] == 'd' || ext[1] == 'D') &&
           (ext[2] == '6') &&
           (ext[3] == '4'));
 }
 
-/* Compara ignorando maiusc/minusc; nomes T64 ja' vem sem o padding de espacos
-   (removido em t64ReadDirectory), entao os dois devem terminar juntos. */
-static int t64NamesMatch(const char *a, const char *b) {
-  while (*a && *b) {
-    char ca = *a++, cb = *b++;
-    if (ca >= 'a' && ca <= 'z') ca -= 32;
-    if (cb >= 'a' && cb <= 'z') cb -= 32;
-    if (ca != cb) return 0;
-  }
-  return (*a == 0 && *b == 0);
+/* Numero de setores em cada trilha do 1541. Trilhas 1-based; entrada [0]
+   nao existe. */
+static int d64SectorsInTrack(int track) {
+  if (track >= 1  && track <= 17) return 21;
+  if (track >= 18 && track <= 24) return 19;
+  if (track >= 25 && track <= 30) return 18;
+  if (track >= 31 && track <= 35) return 17;
+  return 0;
 }
 
-/* Le o diretorio inteiro do container ja' identificado por 'container'.
-   Devolve o numero de entradas validas lidas (0 se nao for um T64 valido). */
-static int t64ReadDirectory(const char *container, T64Entry *entries, int maxEntries) {
+/* Offset (em bytes) do inicio de um setor dentro do .d64. */
+static int d64SectorOffset(int track, int sector) {
+  int off = 0;
+  for (int t = 1; t < track; t++) off += d64SectorsInTrack(t) * D64_SECTOR_SIZE;
+  return off + sector * D64_SECTOR_SIZE;
+}
+
+/* Compara nome ignorando caixa e padding $A0/espaco. */
+static int d64NamesMatch(const char *stored, const char *req) {
+  int i = 0;
+  while (i < 16 && stored[i] && req[i]) {
+    char a = stored[i], b = req[i];
+    if (a == (char)0xA0 || a == ' ') break;
+    if (a >= 'a' && a <= 'z') a -= 32;
+    if (b >= 'a' && b <= 'z') b -= 32;
+    if (a != b) return 0;
+    i++;
+  }
+  /* Fim do requerido bate com fim do armazenado (ou padding) */
+  if (req[i] != 0) return 0;
+  if (i < 16 && stored[i] != 0 && stored[i] != (char)0xA0 && stored[i] != ' ') return 0;
+  return 1;
+}
+
+/* Le todo o diretorio (percorre a cadeia de blocos a partir de 18/1).
+   Devolve o numero de entradas PRG validas. */
+static int d64ReadDirectory(const char *container, D64Entry *entries, int maxEntries) {
+  if (emu_FileOpen((char*)container) == 0) {
+    printf("D64: emu_FileOpen(\"%s\") FALHOU\n", container);
+    return 0;
+  }
+
+  int count = 0;
+  int track = D64_DIR_TRACK, sector = D64_DIR_FIRST_SECT;
+  int safety = 40;   /* limite de blocos de dir a percorrer, evita loop */
+
+  while (safety-- > 0 && track != 0) {
+    uint8_t blk[D64_SECTOR_SIZE];
+    emu_FileSeek(d64SectorOffset(track, sector));
+    if (emu_FileRead((char*)blk, D64_SECTOR_SIZE) != D64_SECTOR_SIZE) break;
+
+    /* proxima trilha/setor do dir esta' nos 2 primeiros bytes */
+    int nextTrack  = blk[0];
+    int nextSector = blk[1];
+
+    for (int i = 0; i < D64_ENTRIES_PER_BLK && count < maxEntries; i++) {
+      uint8_t *e = &blk[2 + i * D64_ENTRY_SIZE];
+      uint8_t type = e[0];
+
+      /* Aceita so' PRG "closed" (0x82). SEQ/USR/REL/DEL sao ignorados. */
+      if (type != 0x82) continue;
+
+      D64Entry *d = &entries[count];
+      d->firstTrack   = e[1];
+      d->firstSector  = e[2];
+      d->sizeInBlocks = e[0x1C] | (e[0x1D] << 8);
+      memcpy(d->name, &e[3], 16);
+      d->name[16] = 0;
+      /* Remove padding $A0 do fim */
+      for (int j = 15; j >= 0 && (d->name[j] == (char)0xA0 || d->name[j] == ' '); j--)
+        d->name[j] = 0;
+      printf("D64:   \"%s\"  T/S=%d/%d  ~%d blocos\n",
+             d->name, d->firstTrack, d->firstSector, d->sizeInBlocks);
+      count++;
+    }
+
+    track = nextTrack;
+    sector = nextSector;
+  }
+
+  emu_FileClose();
+  printf("D64: %d PRG(s) no diretorio\n", count);
+  return count;
+}
+
+/* Percorre a cadeia de setores do arquivo a partir de (startT,startS) e
+   despeja os dados na RAM do C64 a partir de 'addr'. Devolve o total de
+   bytes copiados, ou 0 se erro. */
+static int d64FollowChain(int startT, int startS, uint16_t addr, int skipHead) {
+  int total = 0;
+  int track = startT, sector = startS;
+  int safety = 720;   /* mais que os 683 setores possiveis, com folga */
+
+  while (safety-- > 0 && track != 0) {
+    uint8_t blk[D64_SECTOR_SIZE];
+    emu_FileSeek(d64SectorOffset(track, sector));
+    if (emu_FileRead((char*)blk, D64_SECTOR_SIZE) != D64_SECTOR_SIZE) {
+      printf("D64: erro lendo T/S=%d/%d\n", track, sector);
+      return 0;
+    }
+
+    int nextTrack  = blk[0];
+    int nextSector = blk[1];
+
+    /* Bytes uteis DESTE bloco: se next-track for 0, next-sector diz onde
+       terminam os dados validos; caso contrario, o bloco esta' cheio. */
+    int useful;
+    if (nextTrack == 0) useful = nextSector - 1;   /* -1 porque nextSector aponta o "ultimo byte", 1-based */
+    else                useful = D64_SECTOR_SIZE - 2;
+
+    int start = 2 + skipHead;  /* pula link + (opcionalmente) load address do 1o bloco */
+    useful -= skipHead;
+    skipHead = 0;
+
+    if (useful > 0) {
+      /* Nao ultrapassa 64 KB da RAM do C64 */
+      if ((int)addr + total + useful > 0x10000) useful = 0x10000 - ((int)addr + total);
+      if (useful > 0) {
+        memcpy(&cpu.RAM[addr + total], &blk[start], useful);
+        total += useful;
+      }
+    }
+
+    if (nextTrack == 0) break;
+    track = nextTrack;
+    sector = nextSector;
+  }
+
+  return total;
+}
+
+/* Carrega a entrada de indice 'idx'. 'relocate' vem do secondary address:
+   0 = ignora o load address do arquivo e carrega em $0801 (como KERNAL real
+       faz para LOAD"" sem ,8,1);
+   1 = respeita o load address embutido nos 2 primeiros bytes do arquivo. */
+static int d64LoadEntry(const char *container, D64Entry *entries, int count,
+                        int idx, bool relocate) {
+  if (idx < 0 || idx >= count) return 0;
+
   if (emu_FileOpen((char*)container) == 0) return 0;
 
-  uint8_t hdr[T64_DIR_START];
-  int gotHdr = (emu_FileRead((char*)hdr, sizeof(hdr)) == (int)sizeof(hdr));
-
-  if (!gotHdr || hdr[0] != 'C' || hdr[1] != '6' || hdr[2] != '4') {
+  /* Le so' o primeiro bloco para descobrir o load address */
+  uint8_t blk[D64_SECTOR_SIZE];
+  emu_FileSeek(d64SectorOffset(entries[idx].firstTrack, entries[idx].firstSector));
+  if (emu_FileRead((char*)blk, D64_SECTOR_SIZE) != D64_SECTOR_SIZE) {
+    printf("D64: erro lendo primeiro setor T/S=%d/%d\n",
+           entries[idx].firstTrack, entries[idx].firstSector);
     emu_FileClose();
     return 0;
   }
 
-  int used = hdr[0x24] | (hdr[0x25] << 8);
-  if (used > maxEntries) used = maxEntries;
+  uint16_t fileAddr = blk[2] | (blk[3] << 8);
+  uint16_t addr = relocate ? 0x0801 : fileAddr;
 
-  int count = 0;
-  for (int i = 0; i < used; i++) {
-    uint8_t e[T64_DIR_ENTRY_SIZE];
-    emu_FileSeek(T64_DIR_START + i * T64_DIR_ENTRY_SIZE);
-    if (emu_FileRead((char*)e, T64_DIR_ENTRY_SIZE) != T64_DIR_ENTRY_SIZE) break;
-
-    if (e[0] != 1) continue;  /* 0 = entrada livre; so' aceitamos "arquivo normal" */
-
-    T64Entry *t = &entries[count];
-    t->loadAddr   = e[2] | (e[3] << 8);
-    t->fileOffset = (uint32_t)e[8] | ((uint32_t)e[9] << 8) |
-                    ((uint32_t)e[10] << 16) | ((uint32_t)e[11] << 24);
-    memcpy(t->name, &e[0x10], 16);
-    t->name[16] = 0;
-    for (int j = 15; j >= 0 && t->name[j] == ' '; j--) t->name[j] = 0;
-    count++;
-  }
-
-  emu_FileClose();
-  return count;
-}
-
-/* Tamanho de uma entrada = offset da proxima entrada mais proxima (por
-   POSICAO no arquivo, nao por indice de diretorio) menos o offset desta.
-   A ultima usa o tamanho do container inteiro. O "endereco final" do
-   cabecalho nunca e' usado (ver nota do bug do CONV64 acima). */
-static int t64EntrySize(T64Entry *entries, int count, int idx, int containerSize) {
-  uint32_t start = entries[idx].fileOffset;
-  uint32_t bestNext = (uint32_t)containerSize;
-  for (int i = 0; i < count; i++) {
-    if (entries[i].fileOffset > start && entries[i].fileOffset < bestNext)
-      bestNext = entries[i].fileOffset;
-  }
-  return (int)(bestNext - start);
-}
-
-/* Carrega a entrada 'idx' direto na RAM do C64. Devolve 0 se falhar. */
-static int t64LoadEntry(const char *container, T64Entry *entries, int count, int idx) {
-  int containerSize = emu_FileSize((char*)container);
-  int size = t64EntrySize(entries, count, idx, containerSize);
-  if (size < 2) return 0;
-
-  if (emu_FileOpen((char*)container) == 0) return 0;
-  emu_FileSeek(entries[idx].fileOffset);
-
-  uint8_t addrBytes[2];
-  emu_FileRead((char*)addrBytes, 2);
-  uint16_t addr = addrBytes[0] | (addrBytes[1] << 8);
-
-  emu_FileRead((char*)&cpu.RAM[addr], size - 2);
+  /* Le a cadeia inteira, pulando link + load address do primeiro bloco. */
+  int bytes = d64FollowChain(entries[idx].firstTrack, entries[idx].firstSector,
+                             addr, 2 /* skipHead: link+load addr */);
   emu_FileClose();
 
-  cpu.RAM[0xAF] = (addr + size - 2) & 0xff;
-  cpu.RAM[0xAE] = (addr + size - 2) / 256;
+  if (bytes <= 0) {
+    printf("D64: falhou ao ler o arquivo\n");
+    return 0;
+  }
 
-  printf("T64: \"%s\" carregada em $%04X, %d bytes\n", entries[idx].name, addr, size - 2);
+  cpu.RAM[0xAF] = (addr + bytes) & 0xff;
+  cpu.RAM[0xAE] = (addr + bytes) / 256;
+
+  printf("D64: \"%s\" carregado em $%04X (arquivo dizia $%04X%s), %d bytes\n",
+         entries[idx].name, addr, fileAddr,
+         relocate ? ", relocado p/ BASIC" : "", bytes);
   return 1;
 }
 
-/* Ponto de entrada usado pelo patchLOAD(). 'reqName' == NULL ou "*" carrega a
-   proxima entrada em ordem; qualquer outro valor busca esse nome no
-   diretorio. Devolve 1 se carregou, 0 se nao achou / erro. */
-static int t64Load(const char *reqName) {
-  T64Entry entries[T64_MAX_ENTRIES];
-  int count = t64ReadDirectory(s_t64Container, entries, T64_MAX_ENTRIES);
+/* Ponto de entrada usado pelo patchLOAD().
+   'reqName' == NULL     : LOAD"" -> primeira entrada do diretorio (idioma
+                           comum para "carrega o que estiver ai").
+   'reqName' == "*"      : idem (curinga do KERNAL real).
+   'reqName' == "$"      : NAO tratado aqui -- o KERNAL usa isso para listar
+                           o diretorio no BASIC. Ficaria bom mas e' outro
+                           trabalho (formatar cada entrada como linha BASIC). */
+static int d64Load(const char *reqName, bool relocate) {
+  D64Entry entries[D64_MAX_ENTRIES];
+  int count = d64ReadDirectory(s_d64Container, entries, D64_MAX_ENTRIES);
   if (count == 0) {
-    printf("T64: nao consegui ler o diretorio de \"%s\"\n", s_t64Container);
+    printf("D64: nao consegui ler o diretorio de \"%s\"\n", s_d64Container);
     return 0;
   }
 
   int idx = -1;
-  if (reqName == NULL || strcmp(reqName, "*") == 0) {
-    if (s_t64NextIndex < count) idx = s_t64NextIndex;
+  if (reqName == NULL || strcmp(reqName, "*") == 0 || reqName[0] == 0) {
+    idx = 0;   /* primeira entrada */
   } else {
     for (int i = 0; i < count; i++) {
-      if (t64NamesMatch(entries[i].name, reqName)) { idx = i; break; }
+      if (d64NamesMatch(entries[i].name, reqName)) { idx = i; break; }
     }
   }
 
   if (idx < 0) {
-    printf("T64: \"%s\" nao encontrado em \"%s\" (%d entradas)\n",
-           reqName ? reqName : "*", s_t64Container, count);
+    printf("D64: \"%s\" nao encontrado (%d entradas no diretorio)\n",
+           reqName ? reqName : "*", count);
     return 0;
   }
 
-  int ok = t64LoadEntry(s_t64Container, entries, count, idx);
-  if (ok) s_t64NextIndex = idx + 1;
-  return ok;
+  return d64LoadEntry(s_d64Container, entries, count, idx, relocate);
 }
 
 void patchLOAD(void) {
@@ -368,21 +466,24 @@ uint16_t addr,size;
 
 	printf("%s,%d,%d:", filename, device, secondaryAddress);
 
-	// --- Sessao T64 ---------------------------------------------------------
-	// LOAD"" com um .t64 selecionado no menu: abre o container e lembra dele.
-	// LOAD"NOME" com uma sessao T64 ativa: procura NOME dentro do MESMO
-	// container, em vez de tratar "NOME" como um arquivo solto no cartao --
-	// e' o padrao que loaders multi-parte usam.
+	// --- Sessao D64 ---------------------------------------------------------
+	// LOAD"" com um .d64 selecionado no menu: abre a imagem e lembra dela.
+	// LOAD"NOME" com uma sessao D64 ativa: procura NOME dentro da MESMA
+	// imagem, em vez de tratar "NOME" como arquivo solto no cartao. E' o
+	// idioma dos loaders multi-parte (LOAD"PART2",8,1 depois do LOAD"").
 	if (cpu.RAM[0xB7] == 0) {
-		s_t64Container[0] = 0;
-		if (t64IsT64(filename)) {
-			strncpy(s_t64Container, filename, sizeof(s_t64Container) - 1);
-			s_t64NextIndex = 0;
+		s_d64Container[0] = 0;
+		if (d64IsD64(filename)) {
+			strncpy(s_d64Container, filename, sizeof(s_d64Container) - 1);
 		}
 	}
 
-	if (s_t64Container[0] != 0) {
-		int ok = (cpu.RAM[0xB7] == 0) ? t64Load(NULL) : t64Load(filename);
+	if (s_d64Container[0] != 0) {
+		// secondary=0 -> relocate para $0801 (LOAD sem ,8,1); secondary!=0 ->
+		// respeita endereco do arquivo (LOAD"nome",8,1). Igual ao KERNAL real.
+		bool relocate = (secondaryAddress == 0);
+		int ok = (cpu.RAM[0xB7] == 0) ? d64Load(NULL, relocate)
+		                              : d64Load(filename, relocate);
 		if (!ok) {
 			printf("not found.\n");
 			cpu.pc = 0xf530; //Jump to $F530
@@ -404,11 +505,23 @@ uint16_t addr,size;
 	emu_FileOpen(filename);
 	emu_FileRead(buffer, 2);
 	addr = buffer[1] * 256 + buffer[0];
+
+	// Nao aplicamos a relocacao secondary=0 -> $0801 aqui (como faz o KERNAL
+	// real). E' "errado", mas na pratica funciona MELHOR: os PRGs que circulam
+	// costumam ser autocontidos e esperam ser carregados no seu proprio
+	// endereco, e um LOAD"" seguido de RUN normalmente encontra um stub
+	// BASIC 10 SYS xxxx que faz o pulo. Aplicar a regra do KERNAL fazia o
+	// exolon.prg (que carregava em endereco != $0801) dar ?SYNTAX ERROR IN
+	// 12544, porque o RUN via lixo em $0801. No D64 aplicamos a regra do
+	// KERNAL (la' faz diferenca), aqui no PRG solto deixamos como estava.
+
 	emu_FileRead((char*)&cpu.RAM[addr], size - 2);
 	emu_FileClose();
 
 	cpu.RAM[0xAF] = (addr + size - 2) & 0xff;
 	cpu.RAM[0xAE] = (addr + size - 2) / 256;
+
+	printf("PRG: carregado em $%04X, %d bytes\n", addr, size - 2);
 
 	cpu.y = 0x49; //Offset for "LOADING"
 	cpu.pc = 0xF12B; //Print and return
