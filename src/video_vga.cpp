@@ -35,6 +35,29 @@ static int      pendingLine = -1;
 static unsigned long      s_frames  = 0;   // quadros do VIC-II
 static unsigned long long s_flushUs = 0;   // tempo total convertendo linhas
 
+// Indicador "DISK" estilo Apple ][. Ativado por vga_show_disk() a partir do
+// patches.cpp quando um LOAD e' interceptado. Fica visivel ate' 'deadline'
+// (millis()). Guardamos o millis do ultimo tick observado para nao chamar
+// millis() dentro do IRAM_ATTR (o flushLine gira 15600 vezes/s).
+#define DISK_MAX_LEN 24
+static char     s_diskMsg[DISK_MAX_LEN + 1] = {0};
+static uint32_t s_diskDeadline = 0;
+static uint32_t s_diskNow      = 0;   // atualizado uma vez por quadro
+// Linha e coluna do texto no framebuffer VGA. 8x8 no canto inferior esquerdo,
+// dentro da borda azul lateral (nao competir com o conteudo do C64).
+#define DISK_TEXT_Y (VGA_YRES - 12)
+#define DISK_TEXT_X 4
+
+
+void vga_show_disk(const char *msg, int ms)
+{
+  if (!msg) { s_diskMsg[0] = 0; s_diskDeadline = 0; return; }
+  int n = 0;
+  while (msg[n] && n < DISK_MAX_LEN) { s_diskMsg[n] = msg[n]; n++; }
+  s_diskMsg[n] = 0;
+  s_diskDeadline = millis() + (uint32_t)ms;
+}
+
 
 static void IRAM_ATTR drawScanline(void *arg, uint8_t *dest, int scanLine)
 {
@@ -56,7 +79,12 @@ static void IRAM_ATTR flushLine(int y)
 
   const uint8_t  *lut = _rawLUT;
   uint8_t *fb_line = _fb + y * VGA_XRES;
-  uint8_t borderRaw = lut[vga_rgb565to6(VGA_BORDER_COLOR) & 0x3F];
+  // Cor da borda vem do VIC ($D020). ATENCAO: o VIC monta cpu.vic.palette[]
+  // ja em formato RAW de 6 bits (PALETTE = VGA_RGB6 em vic.cpp), NAO RGB565
+  // -- entao usamos direto como indice do LUT, sem passar pelo vga_rgb565to6.
+  // Antes eu chamava vga_rgb565to6() aqui e a cor saia lixo (borda azul
+  // padrao caia para preto, etc).
+  uint8_t borderRaw = lut[vic_get_border_color() & 0x3F];
 
   // Left border: 20 pixels
   for (int x = 0; x < VGA_BORDER_WIDTH; x++) {
@@ -76,6 +104,29 @@ static void IRAM_ATTR flushLine(int y)
   // Right border: 20 pixels
   for (int x = VGA_XRES - VGA_BORDER_WIDTH; x < VGA_XRES; x++) {
     fb_line[(x ^ 2)] = borderRaw;
+  }
+
+  // Overlay do indicador "DISK" -- desenhado por cima da borda inferior. So'
+  // afeta as 8 linhas do texto, entao 0 custo fora desse intervalo. Nao
+  // chamamos millis() aqui: usamos o s_diskNow atualizado uma vez por quadro
+  // em getLineBuffer(0).
+  if (s_diskMsg[0] && s_diskNow < s_diskDeadline &&
+      y >= DISK_TEXT_Y && y < DISK_TEXT_Y + 8) {
+    int row = y - DISK_TEXT_Y;
+    // Amarelo brilhante sobre preto -- alto contraste, estilo Apple ][.
+    uint8_t fg = lut[vga_rgb565to6(RGBVAL16(0xFF, 0xFF, 0x00)) & 0x3F];
+    uint8_t bg = lut[vga_rgb565to6(RGBVAL16(0x00, 0x00, 0x00)) & 0x3F];
+    int px = DISK_TEXT_X;
+    for (int i = 0; s_diskMsg[i] && px + 8 <= VGA_XRES; i++) {
+      unsigned char ch = (unsigned char)s_diskMsg[i];
+      if (ch >= 128) ch = '?';
+      unsigned char bits = font8x8[ch][row];
+      for (int col = 0; col < 8; col++) {
+        int x = px + col;
+        fb_line[(x ^ 2)] = (bits & (1 << col)) ? fg : bg;
+      }
+      px += 8;
+    }
   }
 
 #if VGA_PROFILE
@@ -123,20 +174,15 @@ void VGA_Video::begin(void)
   for (int i = 0; i < 64; i++)
     _rawLUT[i] = vgaCtrl.createRawPixel(RGB222((i >> 4) & 3, (i >> 2) & 3, i & 3));
 
-  // Fundo inicial com bordas azuis
+  // Fundo inicial todo preto. As bordas laterais viram a cor do VIC ($D020)
+  // na primeira scanline convertida -- nao adianta pintar aqui, ainda nem
+  // resetamos o VIC. Antes tinhamos borda azul fixa no init.
   memset(_fb, _rawLUT[0], VGA_XRES * VGA_YRES);
-  uint8_t borderRaw = _rawLUT[vga_rgb565to6(VGA_BORDER_COLOR) & 0x3F];
-  for (int y = 0; y < VGA_YRES; y++) {
-    for (int x = 0; x < VGA_BORDER_WIDTH; x++)
-      _fb[y * VGA_XRES + (x ^ 2)] = borderRaw;
-    for (int x = VGA_XRES - VGA_BORDER_WIDTH; x < VGA_XRES; x++)
-      _fb[y * VGA_XRES + (x ^ 2)] = borderRaw;
-  }
 
   memset(lineScratch, 0, sizeof(lineScratch));
   vgaReady = true;
 
-  Serial.printf("[VGA] pronto. Compensacao horizontal: 320->280px com 20px bordas azuis.\n");
+  Serial.printf("[VGA] pronto. Compensacao horizontal: 320->280px, borda do VIC ($D020).\n");
   Serial.printf("[VGA] heap interno livre=%u\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   Serial.flush();
@@ -159,7 +205,7 @@ void VGA_Video::refreshFinish(void)  { refresh(); }
 uint16_t * VGA_Video::getLineBuffer(int j)
 {
   // O VIC-II percorre as linhas em ordem; voltar para 0 marca fim de quadro.
-  if (j == 0) s_frames++;
+  if (j == 0) { s_frames++; s_diskNow = millis(); }
 
   if (pendingLine >= 0 && pendingLine != j) flushLine(pendingLine);
   pendingLine = j;

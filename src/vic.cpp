@@ -2136,6 +2136,15 @@ void resetVic(void) {
 }
 
 
+// Cor da borda em formato RAW da FabGL (6 bits, pronto para indexar o LUT
+// do video_vga). O VIC monta cpu.vic.palette[] usando PALETTE = VGA_RGB6
+// em vic.cpp, entao colors[0] ja' esta nesse formato -- devolvemos direto.
+extern "C" uint16_t vic_get_border_color(void)
+{
+  return cpu.vic.colors[0] & 0x3F;
+}
+
+
 /*
   ?PEEK(678) NTSC =0
   ?PEEK(678) PAL = 1

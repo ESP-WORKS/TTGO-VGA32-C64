@@ -42,7 +42,24 @@
 // Compensation horizontal: bordas laterais para reduzir área de conteúdo
 #define VGA_BORDER_WIDTH 20
 #define VGA_CONTENT_XRES (VGA_XRES - 2 * VGA_BORDER_WIDTH)  // 280 pixels para C64
-#define VGA_BORDER_COLOR RGBVAL16(0x00, 0x00, 0xFF)  // Azul
+
+// Cor da borda VEM DO VIC. O registrador $D020 (EC) do C64 real determina a
+// cor da borda, e jogos mudam isso o tempo todo (Boulder Dash pisca branco
+// nos flashes, muitos jogos usam preto em vez do azul padrao). Antes a cor
+// era fixa em VGA_BORDER_COLOR = azul; agora consultamos o VIC a cada linha.
+// vic_get_border_color() e' fornecida em vic.cpp e devolve RGB565.
+#ifdef __cplusplus
+extern "C" {
+#endif
+uint16_t vic_get_border_color(void);
+
+// Indicador de acesso a "disco" estilo Apple ][. Chamado por patches.cpp
+// quando um LOAD e' interceptado. A mensagem aparece no canto inferior
+// esquerdo por ~2 segundos (esse tempo e' contado internamente em ms).
+void vga_show_disk(const char *msg, int millis);
+#ifdef __cplusplus
+}
+#endif
 
 // Mantido: emuapi.cpp e vic_palette.h usam RGBVAL16 como tipo de cor.
 #define RGBVAL16(r,g,b)  ( (((r>>3)&0x1f)<<11) | (((g>>2)&0x3f)<<5) | (((b>>3)&0x1f)<<0) )

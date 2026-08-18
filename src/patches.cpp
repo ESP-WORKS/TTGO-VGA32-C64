@@ -35,6 +35,7 @@
 
 #include "patches.h"
 #include <string.h>
+#include "video_vga.h"
 
 
 #define DIRECTORY ROMSDIR + "/\0"
