@@ -35,6 +35,14 @@ static uint16_t s_mask   = 0;   // ESTADO das teclas (nivel): para o jogo
 static uint16_t s_events = 0;   // EVENTOS 'down' acumulados: para o menu
 static uint8_t  s_held   = 0;   // ASCII da tecla atualmente SEGURADA
 
+// Modo joystick, alternado por F2. Ligado: Q/A/O/P/SPACE viram joystick
+// (layout Sinclair classico) e sao SUPRIMIDAS do caminho de teclado --
+// nao entram em s_held nem na fila ASCII, senao no jogo elas mandariam os
+// dois sinais ao mesmo tempo. Desligado: as mesmas teclas digitam normal.
+// Existe porque Q/A/O/P sao letras -- sem o toggle, digitar no BASIC viraria
+// comando de joystick.
+static bool s_joyMode = false;
+
 // Por que dois acumuladores:
 //   - O jogo quer NIVEL: seta segurada = direcao mantida. Isso e' s_mask.
 //   - O menu quer EVENTO: cada pressionar = um passo, e segurar deve repetir
@@ -96,6 +104,23 @@ static uint16_t maskOf(fabgl::VirtualKey vk) {
   }
 }
 
+// Teclas que viram JOYSTICK quando s_joyMode esta ligado. Layout Sinclair:
+//   Q = cima     A = baixo     O = esquerda     P = direita     SPACE = fire
+// Separada de maskOf() de proposito: maskOf() serve a navegacao do menu
+// (s_events), esta serve ao jogo (s_mask, por nivel). O bit final e' o
+// mesmo (M_JOY2_*), e cai em cia1PORTA/PORTB via emu_ReadKeys() -- porta 1
+// ou 2 conforme o SWAP (F1).
+static uint16_t joyMaskOf(fabgl::VirtualKey vk) {
+  switch (vk) {
+    case fabgl::VK_q: case fabgl::VK_Q:  return M_JOY2_UP;
+    case fabgl::VK_a: case fabgl::VK_A:  return M_JOY2_DOWN;
+    case fabgl::VK_o: case fabgl::VK_O:  return M_JOY2_LEFT;
+    case fabgl::VK_p: case fabgl::VK_P:  return M_JOY2_RIGHT;
+    case fabgl::VK_SPACE:                return M_JOY2_BTN;
+    default: return 0;
+  }
+}
+
 // Drena a fila da FabGL. Chamada pelos dois getters, entao o teclado responde
 // tanto no menu quanto em jogo.
 static void ps2kbd_poll(void)
@@ -123,6 +148,33 @@ static void ps2kbd_poll(void)
     Serial.printf("[PS2] vk=%d down=%d ascii=%d\n",
                   (int)vk, (int)down, (int)kb->virtualKeyToASCII(vk));
 #endif
+
+    // F2 alterna o modo joystick (Q/A/O/P/SPACE = joystick vs. teclado).
+    // So' na borda de descida, e nunca chega ao C64 -- e' hotkey nosso.
+    if (vk == fabgl::VK_F2) {
+      if (down) {
+        s_joyMode = !s_joyMode;
+        // Libera qualquer direcao que tenha ficado presa quando o modo mudou.
+        s_mask &= ~(M_JOY2_UP | M_JOY2_DOWN | M_JOY2_LEFT |
+                    M_JOY2_RIGHT | M_JOY2_BTN);
+        Serial.printf("[joy] modo joystick %s (Q/A/O/P/SPACE)\n",
+                      s_joyMode ? "ON" : "OFF");
+      }
+      continue;
+    }
+
+    // No modo joystick, Q/A/O/P/SPACE alimentam s_mask como joystick e
+    // NAO seguem para o caminho de teclado -- senao no jogo mandariam
+    // direcao e letra ao mesmo tempo.
+    if (s_joyMode) {
+      uint16_t jm = joyMaskOf(vk);
+      if (jm) {
+        if (down) s_mask |= jm;
+        else      s_mask &= ~jm;
+        continue;
+      }
+    }
+
     uint16_t m = maskOf(vk);
     if (m) {
       // Dois destinos, com criterio: as teclas de NAVEGACAO (setas + ENTER)
@@ -226,9 +278,11 @@ int ps2kbd_read_ascii(void)
 uint16_t ps2kbd_get_mask(void)
 {
   ps2kbd_poll();
-  // Devolve o estado de nivel das HOTKEYS (F1/F5/F6). As setas nao entram
-  // aqui de proposito -- para elas usar ps2kbd_get_events(), que o menu
-  // consome. Ver ps2kbd_poll() para a separacao.
+  // Devolve o estado de nivel de:
+  //   - HOTKEYS: F1 (SWAP + LOAD""+RUN), F5 (reset C64), F6 (menu).
+  //   - JOYSTICK: Q/A/O/P/SPACE quando o modo joystick esta ligado (F2).
+  // As setas de proposito NAO entram aqui -- para navegacao de menu usar
+  // ps2kbd_get_events(). Ver ps2kbd_poll() para a separacao completa.
   return s_mask;
 }
 
