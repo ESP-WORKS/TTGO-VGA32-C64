@@ -114,8 +114,8 @@ static uint16_t joyMaskOf(fabgl::VirtualKey vk) {
   switch (vk) {
     case fabgl::VK_q: case fabgl::VK_Q:  return M_JOY2_UP;
     case fabgl::VK_a: case fabgl::VK_A:  return M_JOY2_DOWN;
-    case fabgl::VK_o: case fabgl::VK_O:  return M_JOY2_LEFT;
-    case fabgl::VK_p: case fabgl::VK_P:  return M_JOY2_RIGHT;
+    case fabgl::VK_o: case fabgl::VK_O:  return M_JOY2_RIGHT;
+    case fabgl::VK_p: case fabgl::VK_P:  return M_JOY2_LEFT;
     case fabgl::VK_SPACE:                return M_JOY2_BTN;
     default: return 0;
   }

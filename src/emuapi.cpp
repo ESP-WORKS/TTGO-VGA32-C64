@@ -100,6 +100,16 @@ static int topFile=0;
 static char selection[MAX_FILENAME_SIZE+1]="";
 static uint8_t prev_zt=0; 
 
+// Cache dos nomes visiveis na pagina atual. Existe para o redesenho parcial:
+// quando o cursor anda dentro da mesma pagina, so' precisamos redesenhar as
+// duas linhas que trocaram (a antiga volta ao normal, a nova recebe o
+// destaque). Sem isso a tela inteira era relida do SD e redesenhada a cada
+// tecla, e a lista "piscava" a cada seta -- exatamente o efeito ruim que o
+// usuario reportou.
+static char pageNames[MAX_MENULINES][MAX_FILENAME_SIZE+1];
+static int  pageCount   = 0;    // quantos slots de pageNames[] estao validos
+static int  prevCurFile = -1;   // -1 = ainda nao desenhamos nada
+
 // "._Nome" e' o arquivo de recurso (AppleDouble) que o macOS cria toda vez
 // que copia algo para um volume FAT/exFAT -- some cartao acaba cheio deles,
 // um para cada arquivo de verdade. Sem este filtro eles aparecem no menu
@@ -219,6 +229,7 @@ void toggleMenu(bool on) {
     callibrationOn=false;
     menuOn=true;
     menuRedraw=true;  
+    prevCurFile=-1;   // invalida cache: a proxima chamada faz redraw full
     video.fillScreenNoDma(RGBVAL16(0x00,0x00,0x00));
     // false = fonte pequena (8x8), igual ao resto do menu agora.
     video.drawTextNoDma(0,0, TITLE, RGBVAL16(0x00,0xff,0xff), RGBVAL16(0x00,0x00,0xff), false);  
@@ -350,6 +361,88 @@ bool menuActive(void)
   return (menuOn);
 }
 
+// ----- Redesenho parcial do menu -----------------------------------------
+//
+// A pagina e' fixa: topFile = (curFile / MAX_MENULINES) * MAX_MENULINES.
+// O cursor anda de 1 em 1 dentro da pagina; quando cruza a borda, a pagina
+// inteira e' trocada. Isso substitui o scroll centralizado antigo, que
+// mudava topFile a cada seta.
+
+static void menu_drawLine(int row, const char *name, bool highlight)
+{
+  uint16_t fg = highlight ? RGBVAL16(0xff,0xff,0x00) : MENU_FILE_FGCOLOR;
+  uint16_t bg = highlight ? RGBVAL16(0xff,0x00,0x00) : MENU_FILE_BGCOLOR;
+  // Limpa a linha antes de escrever: sem isso o nome antigo (quando mais
+  // longo que o novo) deixa "restos" a direita. Tambem serve para trocar o
+  // fundo entre azul/vermelho no redesenho parcial.
+  video.drawRectNoDma(MENU_FILE_XOFFSET,
+                      row*TEXT_HEIGHT + MENU_FILE_YOFFSET,
+                      MENU_FILE_W, TEXT_HEIGHT, bg);
+  video.drawTextNoDma(MENU_FILE_XOFFSET,
+                      row*TEXT_HEIGHT + MENU_FILE_YOFFSET,
+                      name, fg, bg, false);
+}
+
+// Le a pagina atual do SD e enche pageNames[]. So' e' chamada quando a
+// pagina muda (flip) ou o diretorio muda (entrou/saiu de pasta), nao a cada
+// tecla. Espelha o filtro do handleMenu original: pula "._*", pula "." e
+// "..", conta so' regular files e diretorios reais.
+static void menu_fillPage(void)
+{
+  pageCount = 0;
+  DIR* dir = opendir(romspath);
+  if (!dir) {
+    printf("ERRO: nao consegui abrir %s\n", romspath);
+    return;
+  }
+  int fileIndex = 0;
+  struct dirent* de;
+  while ((de = readdir(dir)) != NULL && pageCount < MAX_MENULINES) {
+    if (isJunkFile(de->d_name)) continue;
+    if ((de->d_type == DT_REG) ||
+        ((de->d_type == DT_DIR) && strcmp(de->d_name,".") && strcmp(de->d_name,".."))) {
+      if (fileIndex >= topFile) {
+        strncpy(pageNames[pageCount], de->d_name, MAX_FILENAME_SIZE);
+        pageNames[pageCount][MAX_FILENAME_SIZE] = 0;
+        pageCount++;
+      }
+      fileIndex++;
+    }
+  }
+  closedir(dir);
+}
+
+static void menu_drawFooter(void)
+{
+  int page  = (topFile / MAX_MENULINES) + 1;
+  int pages = (nbFiles + MAX_MENULINES - 1) / MAX_MENULINES;
+  if (pages < 1) pages = 1;
+  char footer[41];
+  snprintf(footer, sizeof(footer),
+           "ENTER=ok LR=pag F1=SWAP(%d) %d/%d",
+           emu_SwapJoysticks(1), page, pages);
+  video.drawTextNoDma(MENU_FILE_XOFFSET, MENU_FOOTER_YOFFSET, footer,
+                      RGBVAL16(0x00,0xff,0xff), RGBVAL16(0x00,0x00,0x00), false);
+}
+
+static void menu_drawFullPage(void)
+{
+  menu_fillPage();
+  // Limpa a area inteira uma vez, depois desenha linha a linha. Mais rapido
+  // do que 24 drawRect individuais.
+  video.drawRectNoDma(MENU_FILE_XOFFSET, MENU_FILE_YOFFSET,
+                      MENU_FILE_W, MENU_FILE_H, MENU_FILE_BGCOLOR);
+  for (int row = 0; row < pageCount; row++) {
+    bool hl = (row + topFile) == curFile;
+    menu_drawLine(row, pageNames[row], hl);
+    if (hl) {
+      strncpy(selection, pageNames[row], MAX_FILENAME_SIZE);
+      selection[MAX_FILENAME_SIZE] = 0;
+    }
+  }
+  menu_drawFooter();
+}
+
 int handleMenu(uint16_t bClick)
 {
   int action = ACTION_NONE;
@@ -374,107 +467,75 @@ int handleMenu(uint16_t bClick)
   // ENTER (MASK_JOY2_BTN) faz tudo: se o item selecionado for pasta, entra
   // nela; se for arquivo, roda. O F1 (USER1) so' alterna o SWAP -- antes ele
   // tambem entrava em pasta, o que era redundante com o ENTER e confuso.
+  //
+  // As setas so' mexem em curFile. A decisao entre redesenho parcial (duas
+  // linhas) e full (pagina inteira) e' feita no bloco de desenho abaixo, a
+  // partir da comparacao entre topFile atual e o topFile derivado de curFile.
   if ( (bClick & MASK_JOY2_BTN) && newPathIsDir ) {
       menuRedraw=true;
       strcpy(romspath,newpath);
       curFile = 0;
+      topFile = 0;
+      prevCurFile = -1;   // forca full redraw do novo diretorio
       nbFiles = readNbFiles();     
   }
   else if ( (bClick & MASK_JOY2_BTN) ) {
-      menuRedraw=true;
       action = ACTION_RUN;       
   }
   else if (bClick & MASK_JOY2_UP) {
-    if (curFile!=0) {
-      menuRedraw=true;
-      curFile--;
-    }
+    if (curFile > 0) curFile--;
   }
   else if (bClick & MASK_JOY2_DOWN)  {
-    if ((curFile<(nbFiles-1)) && (nbFiles)) {
-      curFile++;
-      menuRedraw=true;
-    }
+    if ((curFile < nbFiles-1) && nbFiles) curFile++;
   }
   // LEFT/RIGHT = pagina inteira (util com muitos arquivos). Antes RIGHT
   // pulava PRA CIMA e LEFT pulava PRA BAIXO -- herdado do layout de toque
   // removido, mas contraintuitivo no teclado. Agora LEFT=cima, RIGHT=baixo.
   else if (bClick & MASK_JOY2_LEFT) {
-    if ((curFile-MAX_MENULINES)>=0) {
-      menuRedraw=true;
-      curFile -= MAX_MENULINES;
-    } else if (curFile!=0) {
-      menuRedraw=true;
-      curFile=0;
-    }
+    if (curFile >= MAX_MENULINES) curFile -= MAX_MENULINES;
+    else curFile = 0;
   }
   else if (bClick & MASK_JOY2_RIGHT) {
-    if ((curFile<(nbFiles-MAX_MENULINES)) && (nbFiles)) {
-      curFile += MAX_MENULINES;
-      menuRedraw=true;
-    }
-    else if ((curFile<(nbFiles-1)) && (nbFiles)) {
-      curFile = nbFiles-1;
-      menuRedraw=true;
-    }
+    if (curFile + MAX_MENULINES < nbFiles) curFile += MAX_MENULINES;
+    else if (nbFiles) curFile = nbFiles - 1;
   }
   else if (bClick & MASK_KEY_USER1) {
     emu_SwapJoysticks(0);
-    menuRedraw=true;  
+    menuRedraw=true;    // rodape mostra o novo estado do SWAP
   }   
 
-    
-  if (menuRedraw && nbFiles) {
-         
-    int fileIndex = 0;
-    DIR* dir = opendir(romspath);
-    if (!dir) {
-      printf("ERRO: nao consegui abrir %s\n", romspath);
-      return (action);
-    }
-    
-    video.drawRectNoDma(MENU_FILE_XOFFSET,MENU_FILE_YOFFSET, MENU_FILE_W, MENU_FILE_H, MENU_FILE_BGCOLOR);
-    if (curFile <= (MAX_MENULINES-1)) topFile=0;
-    else topFile=curFile-(MAX_MENULINES/2);
-    
-    int i=0;
-    while (i<MAX_MENULINES) {
-      struct dirent* de = readdir(dir);
-      if (!de) {
-        break;
-      }     
-      if (isJunkFile(de->d_name)) continue;
-      if ( (de->d_type == DT_REG) || ((de->d_type == DT_DIR) && (strcmp(de->d_name,".")) && (strcmp(de->d_name,"..")) ) ) {
-        if (fileIndex >= topFile) {              
-          if ((i+topFile) < nbFiles ) {
-            if ((i+topFile)==curFile) {
-              video.drawTextNoDma(MENU_FILE_XOFFSET,i*TEXT_HEIGHT+MENU_FILE_YOFFSET, de->d_name, RGBVAL16(0xff,0xff,0x00), RGBVAL16(0xff,0x00,0x00), false);
-              strncpy(selection,de->d_name,MAX_FILENAME_SIZE);
-              selection[MAX_FILENAME_SIZE]=0;
-            }
-            else {
-              video.drawTextNoDma(MENU_FILE_XOFFSET,i*TEXT_HEIGHT+MENU_FILE_YOFFSET, de->d_name, MENU_FILE_FGCOLOR, MENU_FILE_BGCOLOR, false);      
-            }
-          }
-          i++; 
-        }
-        fileIndex++;    
-      }
-    }
-    closedir(dir);
+  if (!nbFiles) return action;
 
-    // ENTER abre pasta ou roda arquivo; F1 so' alterna o SWAP.
-    char footer[41];
-    snprintf(footer, sizeof(footer), "ENTER=abrir/rodar ARROWS=nav F1=SWAP(%d)",
-             emu_SwapJoysticks(1));
-    video.drawTextNoDma(MENU_FILE_XOFFSET, MENU_FOOTER_YOFFSET, footer,
-                        RGBVAL16(0x00,0xff,0xff), RGBVAL16(0x00,0x00,0x00), false);
+  // ---- Redesenho ---------------------------------------------------------
+  //
+  // Tres casos:
+  //   1. menuRedraw setado (troca de pasta, SWAP, primeira entrada) -> full
+  //   2. curFile mudou de pagina                                    -> full
+  //   3. curFile mudou de linha na mesma pagina                     -> parcial
 
-    menuRedraw=false;     
+  int newTopFile = (curFile / MAX_MENULINES) * MAX_MENULINES;
+
+  if (menuRedraw || newTopFile != topFile || prevCurFile < 0) {
+    topFile = newTopFile;
+    menu_drawFullPage();
+    menuRedraw  = false;
+    prevCurFile = curFile;
+  }
+  else if (curFile != prevCurFile && pageCount > 0) {
+    int oldRow = prevCurFile - topFile;
+    int newRow = curFile     - topFile;
+    if (oldRow >= 0 && oldRow < pageCount) {
+      menu_drawLine(oldRow, pageNames[oldRow], false);
+    }
+    if (newRow >= 0 && newRow < pageCount) {
+      menu_drawLine(newRow, pageNames[newRow], true);
+      strncpy(selection, pageNames[newRow], MAX_FILENAME_SIZE);
+      selection[MAX_FILENAME_SIZE] = 0;
+    }
+    prevCurFile = curFile;
   }
 
-
-  return (action);  
+  return action;
 }
 
 char * menuSelection(void)
