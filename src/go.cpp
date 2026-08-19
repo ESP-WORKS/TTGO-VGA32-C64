@@ -8,12 +8,18 @@ extern "C" {
   #include "iopins.h"
 }
 
+// emuapi.cpp: zera bLastState para evitar bordas fantasma ao abrir o menu.
+extern void emu_ResetKeyState(void);
+
+
 #include "esp_event.h"
 #include "esp_timer.h"
 
 #include "keyboard_osd.h"
 #ifdef HAS_PS2KBD
 #include "ps2kbd.h"
+// Declaracao adiantada caso ps2kbd.h nao tenha:
+int ps2kbd_get_joy_mode(void);
 #endif
 #include "video_vga.h"
 #include "esp_system.h"
@@ -28,6 +34,13 @@ extern "C" {
 
 
 VGA_Video video;
+
+// Flag para a input_task executar emu_Input(). O emu_Input() chama
+// c64_Input() -> setKey() -> vTaskDelay(20ms), que precisa do 6502 rodando
+// para a tecla ser lida pela matriz. Se chamarmos na emuthread, o setKey()
+// congela a mesma CPU que deveria ler a tecla. Por isso a input_task roda
+// no core 1 e a emuthread so' liga o flag.
+static volatile uint16_t s_pendingInput = 0;
 #ifdef HAS_SND
 AudioPlaySystem audio;
 #endif
@@ -84,9 +97,17 @@ static uint16_t keys_edge(void)
 static void keys_resync(void)
 {
 #ifdef HAS_PS2KBD
-  ps2kbd_get_events();          // joga fora setas/ENTER acumulados
+  // Esvazia a fila de eventos do teclado. Sem isto, setas e ENTER acumulados
+  // durante o jogo saem todos de uma vez quando o menu abre.
+  while (ps2kbd_get_events()) {}   // drena tudo, nao so' o primeiro
 #endif
-  s_prevKeys = emu_ReadKeys();  // nada que ja' esteja apertado vira borda
+  s_prevKeys = emu_ReadKeys();     // nada que ja' esteja apertado vira borda
+
+  // O bLastState do emu_GetMenuKeys() fica parado enquanto o jogo roda
+  // (ninguem chama emu_GetMenuKeys la'). Na primeira leitura do menu, a borda
+  // (bCurState & ~bLastState) produzia bits fantasma: a lista pulava sozinha
+  // ou disparava ACTION_RUN sem ninguem apertar nada.
+  emu_ResetKeyState();
 }
 
 
@@ -103,15 +124,24 @@ static void spi_task(void *args)
   } 
 }
 
-// So' audio e link. NAO LE TECLADO -- ver "DONO UNICO DO TECLADO" acima.
-// O emu_DebounceLocalKeys()/emu_Input() que moravam aqui foram para
-// keys_step(), na emuthread.
+// Audio, link e emu_Input (que bloqueia com vTaskDelay). NAO LE TECLADO --
+// ver "DONO UNICO DO TECLADO" acima. O teclado e' lido pela emuthread, que
+// seta s_pendingInput quando o F11 e' detectado.
 static void input_task(void *args)
 {
   while(true) {
 #ifdef HAS_TDISPLAY_LINK
-    link_poll();   // core 0, a few bytes out of a FIFO: costs nothing
+    link_poll();
 #endif
+    // Se a emuthread pediu um emu_Input (F11 = LOAD""+RUN), executa aqui.
+    // O emu_Input -> c64_Input -> setKey() faz vTaskDelay internamente,
+    // entao PRECISA rodar numa task separada do 6502 para as teclas serem
+    // lidas pela matriz.
+    uint16_t inp = s_pendingInput;
+    if (inp) {
+      s_pendingInput = 0;
+      emu_Input(inp);
+    }
 #ifdef HAS_SND      
     audio.step();
 #endif  
@@ -212,26 +242,37 @@ static void keys_step(void)
     return;
   }
 
-  emu_Input(edge);
+  // F11 (MASK_KEY_USER1 = macro LOAD""+RUN): delega para a input_task.
+  // O emu_Input() chama setKey() com vTaskDelay -- se rodar aqui, congela o
+  // 6502 e a matriz nunca le a tecla.
+  if (edge & MASK_KEY_USER1) {
+    s_pendingInput = edge;
+    return;
+  }
 }
 
 static void main_step() {
   if (menuActive()) {
 #ifdef HAS_TDISPLAY_LINK
-    // input_task may not exist yet (or the picker was re-opened while it runs
-    // but does not own this branch): without this the pad looks dead in the
-    // ROM picker.
     link_poll();
 #endif
-    // F9 fecha o menu e volta para o jogo, sem carregar nada. Sem isto o
-    // unico jeito de sair era escolher um arquivo.
-    if (keys_edge() & MASK_KEY_MENU) {
-      closeMenu();
-      return;
-    }
-    // emu_GetMenuKeys (nao ...DebounceLocalKeys): as setas do PS/2 vem por
-    // EVENTO com auto-repeat, senao segurar a seta so' anda 1 item.
+    // emu_GetMenuKeys: setas/ENTER do PS/2 vem por EVENTO (com auto-repeat
+    // proprio de ~22/s), e os botoes do gamepad vem por borda de nivel.
     uint16_t bClick = emu_GetMenuKeys();
+
+    // F9 fecha o menu. O bit MASK_KEY_MENU NAO chega em bClick (o
+    // emu_GetMenuKeys filtra hotkeys), entao checamos direto pelo nivel.
+    // A guarda s_menuF9 evita que F9 seguro reabra+feche em loop.
+    {
+      static bool s_menuF9held = false;
+      bool f9now = (emu_ReadKeys() & MASK_KEY_MENU) != 0;
+      if (f9now && !s_menuF9held) {
+        s_menuF9held = true;
+        closeMenu();
+        return;
+      }
+      if (!f9now) s_menuF9held = false;
+    }
     int action = handleMenu(bClick);
     char * filename = menuSelection();
     if (action == ACTION_RUN) {
@@ -352,6 +393,20 @@ void emu_loop(void)
       if (!menuActive()) {
         keys_step();
       }
+
+      // ---- Indicador de modo joystick no canto inferior direito ---------
+#ifdef HAS_PS2KBD
+      {
+        int jm = ps2kbd_get_joy_mode();
+        if (jm == 1) {
+          video.drawTextNoDma(304, 232, "J1",
+            RGBVAL16(0x00,0xff,0x00), RGBVAL16(0x00,0x00,0x00), false);
+        } else if (jm == 2) {
+          video.drawTextNoDma(304, 232, "J2",
+            RGBVAL16(0xff,0xff,0x00), RGBVAL16(0x00,0x00,0x00), false);
+        }
+      }
+#endif
     }
   }
 

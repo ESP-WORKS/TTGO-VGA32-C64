@@ -849,6 +849,15 @@ int emu_LoadFileSeek(char * filename, char * buf, int size, int seek)
 static int keypadval=0; 
 static bool joySwapped = false;
 static uint16_t bLastState;
+
+// Chamado ao entrar/sair do menu (de go.cpp via keys_resync). Sem isto o
+// bLastState fica com o valor do ultimo emu_GetMenuKeys(), que pode ter sido
+// ha' minutos, e a borda (bCurState & ~bLastState) na primeira leitura do
+// menu dispara bits fantasma -- a lista pula sozinha ou uma acao dispara sem
+// o usuario tocar em nada.
+void emu_ResetKeyState(void) {
+  bLastState = emu_ReadKeys();
+}
 static int xRef;
 static int yRef;
 
@@ -955,8 +964,15 @@ int emu_ReadKeys(void)
   // seja, RESET. Um bit de botao qualquer resetava o C64 do nada.
   //
   // Separamos os atalhos antes de deslocar e recolocamos depois.
+  // Tudo que NAO e' joystick analogico/gamepad (bits JOY2 no byte baixo)
+  // deve ser separado antes do swap e reinjetado depois:
+  //  - hotkeys (USER1..4, MENU, RESET): 0x0020..0x8000 no byte baixo
+  //  - joystick de teclado J1: M_JOY1_* no byte alto (0x0100..0x1000)
+  // Sem isto o shift do swap joga esses bits para fora do uint16_t.
   const uint16_t hotBits = MASK_KEY_USER1 | MASK_KEY_USER2 | MASK_KEY_USER3 |
-                           MASK_KEY_USER4 | MASK_KEY_MENU  | MASK_KEY_RESET;
+                           MASK_KEY_USER4 | MASK_KEY_MENU  | MASK_KEY_RESET |
+                           MASK_JOY1_RIGHT| MASK_JOY1_LEFT | MASK_JOY1_UP   |
+                           MASK_JOY1_DOWN | MASK_JOY1_BTN;
   uint16_t hot = j1 & hotBits;
   j1 &= ~hotBits;
 
@@ -968,6 +984,13 @@ int emu_ReadKeys(void)
   }
 
   retval |= hot;
+
+#ifdef HAS_PS2KBD
+  // Joystick por teclado (F12): os bits ja vem posicionados como M_JOY1_*
+  // ou M_JOY2_* conforme o modo. Adicionados DEPOIS do swap para nao serem
+  // embaralhados -- o usuario escolheu a porta, nao depende do swap global.
+  // ps2kbd_get_mask() devolve os bits de joyMode junto com os hotkeys.
+#endif
 
   // Botoes fisicos USER1..4 NAO existem na TTGO VGA32. Os GPIOs 35/34/39/36
   // ficam flutuando (sem pull-up ligado no emu_InitJoysticks), e leitura

@@ -31,6 +31,11 @@
 #define M_JOY2_UP    0x0004
 #define M_JOY2_DOWN  0x0008
 #define M_JOY2_BTN   0x0010
+#define M_JOY1_RIGHT 0x0100
+#define M_JOY1_LEFT  0x0200
+#define M_JOY1_UP    0x0400
+#define M_JOY1_DOWN  0x0800
+#define M_JOY1_BTN   0x1000
 #define M_KEY_USER1  0x0020   // dispara a macro LOAD""+RUN no c64_Input()
 #define M_KEY_MENU   0x4000   // F6: reabre o menu durante o jogo
 #define M_KEY_RESET  0x8000   // F5: reseta o C64 emulado
@@ -38,8 +43,43 @@
 static fabgl::PS2Controller ps2;
 static bool     kbdReady = false;
 static uint16_t s_mask   = 0;   // ESTADO das teclas (nivel): para o jogo
-static uint16_t s_events = 0;   // EVENTOS 'down' acumulados: para o menu
 static uint8_t  s_held   = 0;   // ASCII da tecla atualmente SEGURADA
+
+// ---- Navegacao do menu: FILA de eventos, nao acumulador ------------------
+//
+// s_events era um OR: cada 'down' ligava um bit, e o menu drenava a mascara
+// inteira de uma vez. Dois problemas praticos:
+//
+//  1) PERDA. O menu le a cada 20 ms. Tres toques rapidos na seta dentro da
+//     mesma janela ligavam o MESMO bit -- viravam UM passo. Voce apertava
+//     tres vezes e a lista andava um item.
+//  2) REPETICAO LENTA. Segurar a seta dependia do typematic do proprio
+//     teclado: ~500 ms parado e depois ~11 repeticoes por segundo. E' isso
+//     que da a sensacao de "buferizado" -- aperta, nada, e de repente anda.
+//
+// Agora cada transicao solto->apertado entra numa FILA (nada se perde, e a
+// ordem e' respeitada) e a repeticao de segurar e' gerada AQUI, com tempos
+// que nos controlamos. As repeticoes que o proprio teclado manda sao
+// ignoradas, senao a velocidade dobraria.
+#define NAV_REPEAT_DELAY_MS 280   // espera antes de comecar a repetir
+#define NAV_REPEAT_RATE_MS   45   // intervalo entre repeticoes (~22/s)
+
+#define EVQ_SIZE 12
+static uint16_t evQ[EVQ_SIZE];
+static int      evHead = 0, evTail = 0;
+static uint16_t s_navLevel = 0;   // setas/ENTER apertadas AGORA
+static uint32_t s_navNextMs = 0;  // quando disparar a proxima repeticao
+
+static inline void evPush(uint16_t m) {
+  int n = (evHead + 1) % EVQ_SIZE;
+  if (n != evTail) { evQ[evHead] = m; evHead = n; }   // cheia: descarta
+}
+static inline uint16_t evPop(void) {
+  if (evHead == evTail) return 0;
+  uint16_t m = evQ[evTail];
+  evTail = (evTail + 1) % EVQ_SIZE;
+  return m;
+}
 
 // Modo joystick, alternado por F2. Ligado: Q/A/O/P/SPACE viram joystick
 // (layout Sinclair classico) e sao SUPRIMIDAS do caminho de teclado --
@@ -47,7 +87,8 @@ static uint8_t  s_held   = 0;   // ASCII da tecla atualmente SEGURADA
 // dois sinais ao mesmo tempo. Desligado: as mesmas teclas digitam normal.
 // Existe porque Q/A/O/P sao letras -- sem o toggle, digitar no BASIC viraria
 // comando de joystick.
-static bool s_joyMode = false;
+// 0 = OFF, 1 = teclado mapeia porta 1, 2 = teclado mapeia porta 2
+static int s_joyMode = 0;
 
 // Por que dois acumuladores:
 //   - O jogo quer NIVEL: seta segurada = direcao mantida. Isso e' s_mask.
@@ -175,17 +216,21 @@ static void ps2kbd_poll(void)
                   (int)vk, (int)down, (int)kb->virtualKeyToASCII(vk));
 #endif
 
-    // F12 alterna o modo joystick (Q/A/O/P/SPACE = joystick vs. teclado).
-    // So' na borda de descida, e nunca chega ao C64 -- e' hotkey nosso.
-    // Era F2, mas F2 e' SHIFT+F1 num C64 real e alguns jogos usam.
+    // F12 cicla o modo joystick: OFF -> J1 -> J2 -> OFF.
+    // J1 = Q/A/O/P/SPACE viram joystick na porta 1 do C64.
+    // J2 = idem, porta 2. OFF = teclado normal.
     if (vk == fabgl::VK_F12) {
       if (down) {
-        s_joyMode = !s_joyMode;
+        s_joyMode = (s_joyMode + 1) % 3;
         // Libera qualquer direcao que tenha ficado presa quando o modo mudou.
         s_mask &= ~(M_JOY2_UP | M_JOY2_DOWN | M_JOY2_LEFT |
-                    M_JOY2_RIGHT | M_JOY2_BTN);
-        Serial.printf("[joy] modo joystick %s (Q/A/O/P/SPACE)\n",
-                      s_joyMode ? "ON" : "OFF");
+                    M_JOY2_RIGHT | M_JOY2_BTN |
+                    M_JOY1_UP | M_JOY1_DOWN | M_JOY1_LEFT |
+                    M_JOY1_RIGHT | M_JOY1_BTN);
+        s_navLevel = 0;
+        s_navNextMs = 0;
+        const char *label[] = {"OFF", "J1 (porta 1)", "J2 (porta 2)"};
+        Serial.printf("[joy] modo joystick %s (Q/A/O/P/SPACE)\n", label[s_joyMode]);
       }
       continue;
     }
@@ -193,8 +238,10 @@ static void ps2kbd_poll(void)
     // No modo joystick, Q/A/O/P/SPACE alimentam s_mask como joystick e
     // NAO seguem para o caminho de teclado -- senao no jogo mandariam
     // direcao e letra ao mesmo tempo.
-    if (s_joyMode) {
+    if (s_joyMode != 0) {
       uint16_t jm = joyMaskOf(vk);
+      // Em J1 mode, desloca para M_JOY1_* (byte alto).
+      if (s_joyMode == 1 && jm) jm <<= 8;
       if (jm) {
         if (down) s_mask |= jm;
         else      s_mask &= ~jm;
@@ -220,11 +267,24 @@ static void ps2kbd_poll(void)
       // que o handleMenu() nao espera.
       const uint16_t navBits = M_JOY2_UP | M_JOY2_DOWN | M_JOY2_LEFT |
                                M_JOY2_RIGHT | M_JOY2_BTN;
-      if (down) {
-        if (m & navBits) s_events |= m;         // menu: evento (com repeat)
-        else             s_mask   |= m;         // jogo: nivel do atalho
+      if (m & navBits) {
+        // Navegacao: so' a TRANSICAO conta. A FabGL reentrega 'down' a cada
+        // repeticao do teclado; se aceitassemos, teriamos duas fontes de
+        // repeticao (a do teclado e a nossa) e o cursor voaria.
+        if (down) {
+          if ((s_navLevel & m) == 0) {
+            s_navLevel |= m;
+            evPush(m);
+            s_navNextMs = millis() + NAV_REPEAT_DELAY_MS;
+          }
+        } else {
+          s_navLevel &= ~m;
+          if (!s_navLevel) s_navNextMs = 0;
+        }
       } else {
-        if ((m & navBits) == 0) s_mask &= ~m;   // libera atalho ao soltar
+        // Atalho (F9/F10/F11): nivel puro, lido por emu_ReadKeys().
+        if (down) s_mask |= m;
+        else      s_mask &= ~m;
       }
     }
     int c = kb->virtualKeyToASCII(vk);
@@ -337,17 +397,34 @@ uint16_t ps2kbd_get_mask(void)
   return s_mask;
 }
 
-// Eventos de navegacao acumulados desde a ultima chamada -- e ZERA. Cada
-// pressionar (e cada auto-repeat) conta uma vez. E' o que o menu deve usar
-// para as setas/ENTER, em vez do s_mask de nivel.
+// UM evento de navegacao por chamada (0 = nenhum). O menu chama isto a cada
+// iteracao, entao a cadencia de rolagem e' a do laco do menu, nao a do
+// teclado. Nada se perde: toques rapidos ficam na fila e saem um por vez.
+//
+// Quando a fila esvazia e a tecla continua apertada, geramos a repeticao
+// aqui -- NAV_REPEAT_DELAY_MS ate' comecar, depois um passo a cada
+// NAV_REPEAT_RATE_MS. Para esvaziar a fila (ao abrir/fechar o menu) basta
+// chamar em laco ate' devolver 0.
 uint16_t ps2kbd_get_events(void)
 {
   ps2kbd_poll();
-  uint16_t e = s_events;
-  s_events = 0;
-  return e;
+
+  uint16_t e = evPop();
+  if (e) return e;
+
+  // ENTER de proposito NAO repete: segurar carregaria o jogo varias vezes.
+  uint16_t rep = s_navLevel & ~M_JOY2_BTN;
+  if (rep && s_navNextMs && (int32_t)(millis() - s_navNextMs) >= 0) {
+    s_navNextMs = millis() + NAV_REPEAT_RATE_MS;
+    return rep;
+  }
+  return 0;
 }
 
+
+// Modo joystick atual: 0=OFF, 1=J1 (porta 1), 2=J2 (porta 2).
+// Usado pelo go.cpp para desenhar o indicador visual.
+int ps2kbd_get_joy_mode(void) { return s_joyMode; }
 
 // Tecla atualmente segurada, em ASCII. O c64.cpp injeta isto direto na matriz
 // do teclado em cia1PORTA/PORTB. Sem isso so' existe o caminho setKey(), que
