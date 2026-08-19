@@ -12,8 +12,14 @@
 //
 //  - ps2kbd_read_ascii(): fila de ASCII, consumida por emu_ReadI2CKeyboard(),
 //    que o c64_Input() usa para indexar ascii2scan[]. So' roda com jogo ativo.
-//  - ps2kbd_get_mask():   estado das setas e do Enter como MASK_JOY2_*, para
-//    o menu funcionar. O seletor de ROMs le emu_ReadKeys(), nao o teclado.
+//  - ps2kbd_get_mask():   estado de NIVEL dos atalhos (F9/F10/F11) e do
+//    joystick por teclado (F12). Lido por emu_ReadKeys().
+//  - ps2kbd_get_events(): eventos de navegacao (setas/ENTER) acumulados,
+//    drenados a cada chamada. E' o que o menu consome.
+//
+// QUEM CHAMA: a partir de agosto/2026, SO' a emuthread (core 0). O loop() do
+// Arduino e a input_task nao encostam mais no teclado -- duas tasks em cores
+// diferentes faziam read-modify-write em s_mask/s_events sem lock.
 //
 // As setas e o Enter alimentam os dois caminhos. Em jogo isso faz o Enter
 // contar tambem como fire, o que e' inofensivo: o direcional de verdade vem
@@ -86,19 +92,27 @@ static uint16_t maskOf(fabgl::VirtualKey vk) {
     case fabgl::VK_LEFT:   return M_JOY2_LEFT;
     case fabgl::VK_RIGHT:  return M_JOY2_RIGHT;
     case fabgl::VK_RETURN: return M_JOY2_BTN;
-    // F1 = o antigo botao USER1 (GPIO35) do hardware do MCUME. O c64_Input()
-    // ja reage a ele digitando LOAD"" + Enter, esperando 2 s e digitando RUN.
-    // O patchLOAD() ve o nome vazio (RAM[0xB7]==0) e usa menuSelection(),
-    // ou seja, o arquivo escolhido no menu. Note que so' funciona com .PRG:
-    // o patch le 2 bytes de endereco e despeja o resto na RAM.
-    case fabgl::VK_F1:     return M_KEY_USER1;
-    // F6 reabre o menu durante o jogo (o C64 sozinho nao teria essa tecla;
-    // e' so' um atalho nosso). Consumido em go.cpp, uma vez por quadro.
-    // F5 reseta o C64 emulado (volta ao BASIC), como o reset de um C64 real.
-    // Nao reinicia o ESP32 -- isso continua no USER4 (GPIO36). Consumido em
-    // go.cpp, uma vez por quadro.
-    case fabgl::VK_F5:     return M_KEY_RESET;
-    case fabgl::VK_F6:     return M_KEY_MENU;
+    // ---- ATALHOS DO EMULADOR: F9..F12, NUNCA F1..F8 --------------------
+    // F1..F8 sao teclas DE VERDADE do C64 (linha 0 da matriz do teclado:
+    // F1=$3a, F3=$3c, F5=$3e, F7=$40 em codigo USB; F2/F4/F6/F8 sao as
+    // mesmas com SHIFT). Praticamente todo jogo usa alguma delas na tela de
+    // titulo -- "press F1 to start", selecao de 1/2 jogadores, etc.
+    // Enquanto F1 e F5 eram atalhos NOSSOS, elas eram consumidas aqui e
+    // NUNCA chegavam na matriz: o jogo simplesmente nao via a tecla.
+    //
+    // Por isso os atalhos do emulador vivem de F9 a F12, que o C64 nao tem:
+    //   F9  = abre o menu de ROMs           (M_KEY_MENU,  tratado em go.cpp)
+    //   F10 = reseta o C64 (volta ao BASIC) (M_KEY_RESET, tratado em go.cpp)
+    //   F11 = macro LOAD"" + RUN            (M_KEY_USER1, tratado em c64_Input)
+    //   F12 = liga/desliga o modo joystick  (tratado direto no poll abaixo)
+    //
+    // A macro do F11: o c64_Input() digita LOAD"" + Enter, espera 2 s e
+    // digita RUN. O patchLOAD() ve o nome vazio (RAM[0xB7]==0) e usa o
+    // menuSelection(), ou seja o arquivo escolhido no menu. So' funciona com
+    // .PRG: o patch le 2 bytes de endereco e despeja o resto na RAM.
+    case fabgl::VK_F9:     return M_KEY_MENU;
+    case fabgl::VK_F10:    return M_KEY_RESET;
+    case fabgl::VK_F11:    return M_KEY_USER1;
     case fabgl::VK_KP_ENTER:return M_JOY2_BTN;
     default:               return 0;
   }
@@ -126,6 +140,18 @@ static uint16_t joyMaskOf(fabgl::VirtualKey vk) {
 static void ps2kbd_poll(void)
 {
   if (!kbdReady) return;
+
+  // LIMITADOR DE FREQUENCIA. Nao e' otimizacao prematura: cia1PORTA() e
+  // cia1PORTB() em c64.cpp chamam heldScancode() E emu_ReadKeys(), e cada um
+  // cai aqui. Como o 6502 le essas portas o tempo todo, isto era executado
+  // centenas de milhares de vezes por segundo, entrando na secao critica da
+  // FabGL a cada vez. 1 ms de granularidade e' de sobra para um teclado
+  // (o menu le a 20 ms e o jogo a 20 ms).
+  static uint32_t lastPollUs = 0;
+  uint32_t nowUs = micros();
+  if ((uint32_t)(nowUs - lastPollUs) < 1000) return;
+  lastPollUs = nowUs;
+
   fabgl::Keyboard *kb = ps2.keyboard();
   if (!kb) return;
 
@@ -149,9 +175,10 @@ static void ps2kbd_poll(void)
                   (int)vk, (int)down, (int)kb->virtualKeyToASCII(vk));
 #endif
 
-    // F2 alterna o modo joystick (Q/A/O/P/SPACE = joystick vs. teclado).
+    // F12 alterna o modo joystick (Q/A/O/P/SPACE = joystick vs. teclado).
     // So' na borda de descida, e nunca chega ao C64 -- e' hotkey nosso.
-    if (vk == fabgl::VK_F2) {
+    // Era F2, mas F2 e' SHIFT+F1 num C64 real e alguns jogos usam.
+    if (vk == fabgl::VK_F12) {
       if (down) {
         s_joyMode = !s_joyMode;
         // Libera qualquer direcao que tenha ficado presa quando o modo mudou.
@@ -177,21 +204,27 @@ static void ps2kbd_poll(void)
 
     uint16_t m = maskOf(vk);
     if (m) {
-      // Dois destinos, com criterio: as teclas de NAVEGACAO (setas + ENTER)
-      // vao SO' para s_events (consumido pelo menu). No jogo elas viram
-      // cursor, nao joystick -- tratamos o teclado como o de um C64 real.
+      // Dois destinos, com criterio:
       //
-      // Ja' as teclas de FUNCAO (F1/F5/F6) precisam ir para s_mask, porque
-      // sao hotkeys checados durante o jogo por emu_ReadKeys() (F1=LOAD""+
-      // RUN, F5=reset, F6=menu). Sem isso as F* silenciosamente pararam de
-      // funcionar quando separei as setas do s_mask na rodada passada.
+      //  - NAVEGACAO (setas + ENTER) vai SO' para s_events, o acumulador de
+      //    eventos que o menu consome. No jogo essas teclas viram cursor
+      //    (via heldScancode em c64.cpp), nao joystick -- tratamos o teclado
+      //    como o de um C64 real.
+      //
+      //  - ATALHOS (F9/F10/F11) vao SO' para s_mask, o estado de nivel que
+      //    emu_ReadKeys() devolve e o go.cpp checa por borda uma vez por
+      //    quadro.
+      //
+      // Os atalhos NAO entram mais em s_events. Antes entravam, e o menu
+      // recebia um M_KEY_MENU parado la' dentro na primeira leitura -- lixo
+      // que o handleMenu() nao espera.
       const uint16_t navBits = M_JOY2_UP | M_JOY2_DOWN | M_JOY2_LEFT |
                                M_JOY2_RIGHT | M_JOY2_BTN;
       if (down) {
-        s_events |= m;                          // menu ve tudo (nav e F*)
-        if ((m & navBits) == 0) s_mask |= m;    // jogo so' recebe hotkeys
+        if (m & navBits) s_events |= m;         // menu: evento (com repeat)
+        else             s_mask   |= m;         // jogo: nivel do atalho
       } else {
-        if ((m & navBits) == 0) s_mask &= ~m;   // libera hotkey ao soltar
+        if ((m & navBits) == 0) s_mask &= ~m;   // libera atalho ao soltar
       }
     }
     int c = kb->virtualKeyToASCII(vk);
@@ -218,6 +251,24 @@ static void ps2kbd_poll(void)
         // funcional (a tecla nao esta no PS/2 padrao). E' a tecla que
         // interrompe programas BASIC e sai de muitos loaders.
         case fabgl::VK_ESCAPE:    c = 3;   break;
+        // F1..F8 do C64. A tabela ascii2scan[] reserva os codigos 133..140
+        // para elas (133=F1 -> 0x3a, ..., 140=F8 -> 0x41 em codigo USB), e o
+        // keymatrixmap[] resolve isso para a linha 0 da matriz. Sem estas
+        // linhas o s_held ficava 0 e a tecla nunca chegava ao jogo, que era
+        // o motivo de "aperto F1 e o jogo nao comeca".
+        case fabgl::VK_F1:        c = 133; break;
+        case fabgl::VK_F2:        c = 134; break;   // = SHIFT+F1 no C64
+        case fabgl::VK_F3:        c = 135; break;
+        case fabgl::VK_F4:        c = 136; break;   // = SHIFT+F3 no C64
+        case fabgl::VK_F5:        c = 137; break;
+        case fabgl::VK_F6:        c = 138; break;   // = SHIFT+F5 no C64
+        case fabgl::VK_F7:        c = 139; break;
+        case fabgl::VK_F8:        c = 140; break;   // = SHIFT+F7 no C64
+        // F9..F12 sao atalhos nossos: nunca viram tecla do C64.
+        case fabgl::VK_F9:
+        case fabgl::VK_F10:
+        case fabgl::VK_F11:
+        case fabgl::VK_F12:       c = 0;   break;
         default: break;
       }
 

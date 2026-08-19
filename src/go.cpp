@@ -32,6 +32,64 @@ VGA_Video video;
 AudioPlaySystem audio;
 #endif
 
+// Trace de hotkeys: imprime a mascara toda vez que uma borda e' detectada.
+// Serve para descobrir QUAL bit chega quando voce aperta F5/F6/F1.
+// Deixe em 1 ate' o comportamento estar certo, depois zere.
+#define HOTKEY_TRACE 1
+
+
+// ===========================================================================
+// DONO UNICO DO TECLADO
+//
+// Tudo que le tecla (emu_ReadKeys, emu_DebounceLocalKeys, emu_GetMenuKeys,
+// ps2kbd_get_mask, ps2kbd_get_events) termina em ps2kbd_poll(), que faz
+// read-modify-write em s_mask e s_events. Essas variaveis NAO sao atomicas e
+// NAO tem lock.
+//
+// Antes existiam quatro leitores em dois cores: loop() (core 1, 50 ms),
+// input_task (core 1, 20 ms), o bloco de hotkeys do emu_loop (core 0) e o
+// menu em main_step (core 0). Os sintomas eram:
+//
+//   * setas do menu falhando ou saindo em rajada -- o "le e zera" do
+//     ps2kbd_get_events() no core 0 colidia com o "s_events |= m" do
+//     ps2kbd_poll() chamado pela input_task no core 1;
+//   * F6 disparando reset -- um |= do core 0 reescrevia por cima de um
+//     &= ~m do core 1, o bit do F5 piscava 1->0->1 entre duas amostras e a
+//     deteccao de borda via isso como uma pressionada nova;
+//   * F1 sumindo -- mesma corrida, no mesmo s_mask.
+//
+// REGRA A PARTIR DAQUI: so' a emuthread (core 0) le o teclado, e le UMA VEZ
+// por quadro. A input_task cuida so' de audio e do link. O loop() do Arduino
+// nao encosta no PS/2. Nao adicione nenhuma chamada de teclado fora de
+// keys_step() / main_step() sem repensar isto.
+// ===========================================================================
+
+static uint16_t s_prevKeys = 0;
+
+// Borda de subida (solto -> apertado) desde a ultima chamada. Um unico ponto
+// de leitura, usado tanto no jogo quanto no menu -- os dois rodam na mesma
+// task, entao nao ha corrida.
+static uint16_t keys_edge(void)
+{
+  uint16_t keys = emu_ReadKeys();
+  uint16_t edge = keys & ~s_prevKeys;
+  s_prevKeys = keys;
+  return edge;
+}
+
+// Zera o historico de bordas e descarta o que estiver acumulado. Chamado ao
+// entrar e ao sair do menu: sem isto as setas apertadas durante o jogo saem
+// todas de uma vez quando o menu abre (a lista pula sozinha), e uma tecla
+// ainda segurada na saida do menu gera uma borda falsa no primeiro quadro.
+static void keys_resync(void)
+{
+#ifdef HAS_PS2KBD
+  ps2kbd_get_events();          // joga fora setas/ENTER acumulados
+#endif
+  s_prevKeys = emu_ReadKeys();  // nada que ja' esteja apertado vira borda
+}
+
+
 // Com o ILI9341 esta task bombeava o DMA: video.refresh() bloqueava esperando a
 // transferencia. Com VGA o refresh() retorna na hora, entao o laco virava
 // espera ocupada em prioridade 1 no core 0 e matava o IDLE0 (watchdog).
@@ -45,38 +103,15 @@ static void spi_task(void *args)
   } 
 }
 
+// So' audio e link. NAO LE TECLADO -- ver "DONO UNICO DO TECLADO" acima.
+// O emu_DebounceLocalKeys()/emu_Input() que moravam aqui foram para
+// keys_step(), na emuthread.
 static void input_task(void *args)
 {
   while(true) {
 #ifdef HAS_TDISPLAY_LINK
     link_poll();   // core 0, a few bytes out of a FIFO: costs nothing
 #endif
-    // O combo USER1+USER2 / USER4 reinicia o ESP32 (integracao com o
-    // bootloader). Foi desabilitado porque:
-    //  1) Os botoes fisicos USER1..4 nao existem nesta placa (GPIO 35/34/39/
-    //     36 ficam flutuando).
-    //  2) O F1 do PS/2 injeta MASK_KEY_USER1. Se algum ruido do link
-    //     T-Display fizer USER2 aparecer no mesmo quadro, o combo dispara e
-    //     a placa reseta -- sintoma que aparecia como "apertei F6 e a placa
-    //     resetou antes de abrir o menu".
-    // Para voltar ao bootloader, use a botao de reset fisico do ESP32 ou
-    // remova via serial. Se precisar do reset por combo, escolha outras
-    // teclas (por ex. VK_ESCAPE apertado por 2 s).
-    //if ( ((emu_ReadKeys() & (MASK_KEY_USER1+MASK_KEY_USER2)) == (MASK_KEY_USER1+MASK_KEY_USER2))
-    //  || (emu_ReadKeys() & MASK_KEY_USER4 ) )
-    //{  
-    //  printf("rebooting\n");
-    //  esp_restart();    
-    //}
-
-    uint16_t bClick = emu_DebounceLocalKeys();
-    if (bClick & MASK_KEY_USER2) { 
-      printf("%d\n",emu_SwapJoysticks(1)); 
-      emu_SwapJoysticks(0);
-    }
-    else {
-      emu_Input(bClick);
-    }
 #ifdef HAS_SND      
     audio.step();
 #endif  
@@ -98,8 +133,8 @@ static void startGame(char *filename) {
   toggleMenu(false); 
   video.fillScreenNoDma( RGBVAL16(0x00,0x00,0x00) );
   if (!inputTaskStarted) {
-    // Core 1: tira do core 0 tudo que nao e' o emulador. O audio.step()
-    // desta task chama i2s_write, que pode bloquear.
+    // Core 1: audio.step() chama i2s_write, que pode bloquear -- fora do
+    // core do emulador.
     xTaskCreatePinnedToCore(input_task, "inputthread", 4096, NULL, 2, NULL, 1);
     inputTaskStarted = true;
   }
@@ -111,6 +146,73 @@ static void startGame(char *filename) {
   // A button held during the load must not fire the instant the game starts.
   g_menuRequest = false;
 #endif
+  // O ENTER que escolheu o arquivo ainda pode estar fisicamente apertado, e
+  // o emu_Init pode ter demorado varios segundos (leitura do SD) acumulando
+  // eventos. Comeca o jogo com o teclado limpo.
+  keys_resync();
+}
+
+// Abre o menu por caminho unico, para nao esquecer o resync em nenhum lugar.
+//
+// O keys_resync() aqui e' o conserto do bug do "F9 reseta o jogo". O
+// ps2kbd_poll() acumula cada seta e cada ENTER em s_events enquanto o jogo
+// roda, e ninguem drena isso -- so' o menu drena. Entao, ao abrir, a
+// primeira leitura de emu_GetMenuKeys() devolvia todos os ENTER que voce
+// deu no BASIC de uma vez, com MASK_JOY2_BTN ligado, e o handleMenu()
+// respondia ACTION_RUN no mesmo quadro: o menu abria e ja' rodava o arquivo
+// selecionado, o que na tela parece um reset. As setas guardadas faziam a
+// lista pular sozinha pelo mesmo motivo.
+static void openMenu(void)
+{
+  toggleMenu(true);
+  keys_resync();
+}
+
+// Sai do menu sem carregar nada e volta para onde o C64 parou. O emu_Step()
+// nao roda com o menu aberto, entao o C64 esta apenas congelado -- basta
+// fechar. O VIC redesenha o quadro inteiro, entao a tela do menu some
+// sozinha.
+static void closeMenu(void)
+{
+  toggleMenu(false);
+  keys_resync();
+}
+
+// ---------------------------------------------------------------------------
+// Leitura de teclas do JOGO. Uma vez por quadro (~50 Hz), so' na emuthread.
+// Nao e' chamada com o menu aberto: la' quem manda e' emu_GetMenuKeys().
+// ---------------------------------------------------------------------------
+static void keys_step(void)
+{
+  uint16_t edge = keys_edge();
+  if (!edge) return;
+
+#if HOTKEY_TRACE
+  printf("[hot] edge=%04X  MENU=%04X RESET=%04X USER1=%04X\n",
+         edge, (unsigned)MASK_KEY_MENU, (unsigned)MASK_KEY_RESET,
+         (unsigned)MASK_KEY_USER1);
+  fflush(stdout);
+#endif
+
+  // Prioridade e EXCLUSAO MUTUA. Se os dois bits aparecerem na mesma borda,
+  // o menu ganha e o reset e' descartado -- nunca os dois no mesmo quadro.
+  if (edge & MASK_KEY_MENU) {
+    openMenu();
+    return;
+  }
+  if (edge & MASK_KEY_RESET) {
+    // F10: reseta o C64 (volta ao BASIC), mantendo o que estiver na RAM.
+    emu_Reset();
+    return;
+  }
+
+  if (edge & MASK_KEY_USER2) {
+    printf("%d\n", emu_SwapJoysticks(1));
+    emu_SwapJoysticks(0);
+    return;
+  }
+
+  emu_Input(edge);
 }
 
 static void main_step() {
@@ -121,6 +223,12 @@ static void main_step() {
     // ROM picker.
     link_poll();
 #endif
+    // F9 fecha o menu e volta para o jogo, sem carregar nada. Sem isto o
+    // unico jeito de sair era escolher um arquivo.
+    if (keys_edge() & MASK_KEY_MENU) {
+      closeMenu();
+      return;
+    }
     // emu_GetMenuKeys (nao ...DebounceLocalKeys): as setas do PS/2 vem por
     // EVENTO com auto-repeat, senao segurar a seta so' anda 1 item.
     uint16_t bClick = emu_GetMenuKeys();
@@ -138,7 +246,7 @@ static void main_step() {
 #ifdef HAS_TDISPLAY_LINK
     if (g_menuRequest) {
       g_menuRequest = false;
-      toggleMenu(true);   // clears the T-Display "now playing" line
+      openMenu();   // clears the T-Display "now playing" line
       return;
     }
 #endif
@@ -200,7 +308,7 @@ void emu_setup(void)
   //vTaskPrioritySet(NULL, tskIDLE_PRIORITY+1);     
 
   // Boot direto no BASIC, igual a um C64 de verdade: pula o menu no
-  // power-on. F6 abre o menu depois, a qualquer momento (ver emu_loop).
+  // power-on. F9 abre o menu depois, a qualquer momento (ver emu_loop).
   static char emptyName[1] = {0};
   printf("setup: startGame() -- pulando o menu, indo direto pro BASIC\n");
   fflush(stdout);
@@ -238,36 +346,17 @@ void emu_loop(void)
         nextFrame = now;
       }
 
-#ifdef HAS_PS2KBD
-      // F6 abre o menu durante o jogo, F5 reseta o C64. Checados aqui (uma
-      // vez por quadro, ~50 vezes/s) em vez de dentro de main_step() (15600
-      // vezes/s) -- e' hotkey, nao precisa de latencia sub-quadro.
-      //
-      // Deteccao POR BORDA: guardamos o estado do quadro anterior e so'
-      // disparamos na transicao solto->apertado. Sem isso, a mesma tecla
-      // pressionada por 100 ms dispara em varios quadros seguidos, e F5
-      // (reset) chegava a rodar 5-6 vezes num toque so'.
+      // Teclado do jogo: UMA leitura por quadro, nesta task, neste core.
+      // Atalhos (F9/F10), troca de joystick e emu_Input saem todos daqui --
+      // ver keys_step() e o bloco "DONO UNICO DO TECLADO" no topo.
       if (!menuActive()) {
-        static uint16_t prevKeys = 0;
-        uint16_t keys = emu_ReadKeys();
-        uint16_t edge = keys & ~prevKeys;
-        prevKeys = keys;
-
-        if (edge & MASK_KEY_MENU) {
-          toggleMenu(true);
-        } else if (edge & MASK_KEY_RESET) {
-          // F5: reseta o C64 (volta ao BASIC), mantendo o que estiver na RAM.
-          emu_Reset();
-        }
+        keys_step();
       }
-#endif
     }
   }
 
   // c64_Step() emula UMA linha de raster, entao main_step() e' chamado umas
   // 15600 vezes por segundo -- delay a cada chamada mataria o desempenho.
-  // Mas sem ceder CPU nenhuma o IDLE0 do core 0 nunca roda e o task watchdog
-  // derruba a placa. Cedemos um tick a cada 10 ms de tempo real: custa ~1 ms
   // ---- Instrumentacao de desempenho -------------------------------------
   // Um C64 PAL faz 50 quadros/s e 312 linhas de raster por quadro. c64_Step()
   // emula UMA linha, entao main_step() deveria ser chamado ~15600 vezes/s.
@@ -326,6 +415,8 @@ void setup()
   Serial.begin(115200);
   delay(200);
   Serial.println("\n=== MCUME esp64 (C64) - TTGO VGA32 ===");
+  Serial.println("Atalhos: F9=menu  F10=reset C64  F11=LOAD\"\"+RUN  F12=joystick");
+  Serial.println("F1..F8 sao teclas do C64 e vao direto para o jogo.");
 
   // Integracao com o bootloader (fg1998/esp32-bootloader): apagar o otadata
   // faz o ESP32 voltar para a particao factory no proximo boot, em vez de
@@ -389,11 +480,8 @@ void setup()
 
 void loop()
 {
-  // O emulador roda na emuthread; esta task so' cutuca o teclado. Serve como
-  // rede de seguranca: se o PS/2 responder aqui mas nao no menu, o problema
-  // e' o caminho emu_ReadKeys(), nao a FabGL.
-#ifdef HAS_PS2KBD
-  ps2kbd_get_mask();
-#endif
+  // NAO LE TECLADO. O ps2kbd_get_mask() que estava aqui era o quarto leitor
+  // concorrente do PS/2, rodando no core 1, e drenava/corrompia o estado que
+  // a emuthread precisava no core 0.
   vTaskDelay(50 / portTICK_PERIOD_MS);
 }

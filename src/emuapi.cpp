@@ -945,12 +945,29 @@ int emu_ReadKeys(void)
 
   uint16_t j2 = 0;
 
+  // Os bits de ATALHO ficam FORA da troca de joystick.
+  //
+  // O swap desloca j1 oito bits para a esquerda, e j1 carrega tambem os
+  // atalhos do teclado. Com a troca ligada, MASK_KEY_MENU (0x4000) e
+  // MASK_KEY_RESET (0x8000) saiam pela borda do uint16_t e viravam ZERO --
+  // F9/F10 simplesmente paravam de responder. Pior: MASK_KEY_USER2 (0x40)
+  // virava 0x4000, ou seja, MENU, e MASK_KEY_USER3 (0x80) virava 0x8000, ou
+  // seja, RESET. Um bit de botao qualquer resetava o C64 do nada.
+  //
+  // Separamos os atalhos antes de deslocar e recolocamos depois.
+  const uint16_t hotBits = MASK_KEY_USER1 | MASK_KEY_USER2 | MASK_KEY_USER3 |
+                           MASK_KEY_USER4 | MASK_KEY_MENU  | MASK_KEY_RESET;
+  uint16_t hot = j1 & hotBits;
+  j1 &= ~hotBits;
+
   if (joySwapped) {
     retval = ((j1 << 8) | j2);
   }
   else {
     retval = ((j2 << 8) | j1);
   }
+
+  retval |= hot;
 
   // Botoes fisicos USER1..4 NAO existem na TTGO VGA32. Os GPIOs 35/34/39/36
   // ficam flutuando (sem pull-up ligado no emu_InitJoysticks), e leitura
@@ -1015,6 +1032,14 @@ unsigned short emu_GetMenuKeys(void)
                            MASK_JOY2_RIGHT|MASK_JOY2_BTN;
   if (bClick & navBits) levelClick &= ~navBits;
 #endif
+
+  // Os atalhos do emulador NAO sao assunto do menu. O go.cpp cuida deles
+  // (F9 abre/fecha, F10 reseta). Se a tecla que abriu o menu ainda estiver
+  // apertada, ou se o bLastState estiver desatualizado -- ele so' e' escrito
+  // aqui, e enquanto o jogo roda ninguem chama esta funcao --, a borda de
+  // nivel entrega MASK_KEY_MENU para o handleMenu(), que nao sabe o que
+  // fazer com isso.
+  levelClick &= ~(MASK_KEY_MENU | MASK_KEY_RESET | MASK_KEY_USER1);
 
   bClick |= levelClick;
   return bClick;

@@ -68,8 +68,17 @@ const uint32_t ascii2scan[] = {
  //                               nosso mapeamento; mas manter 127 tambem
  //                               resolve se algum caminho passar por 127)
    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x49,0x2a, // 112-127
- //up left arr      133:f1   f2   f3   f4   f5   f6   f7   f8 
-   75,78,0x00,0x00,0x00,0x3a,0x3b,0x3c,0x3d,0x3e,0x3f,0x40,0x41,0x00,0x00,0x00,  // 128-143
+ // 128:up  129:left     133=F1  134=F2  135=F3  136=F4  137=F5 138=F6 139=F7 140=F8
+ //
+ // O C64 tem 4 teclas de funcao fisicas; F2/F4/F6/F8 sao SHIFT+F1/F3/F5/F7.
+ // Por isso os pares levam o mesmo scancode USB do irmao impar mais o flag
+ // 0x2000 (SHIFT), que o heldScancode() em cia1PORTA/PORTB traduz apertando
+ // o shift esquerdo junto. Antes estavam 0x3b/0x3d/0x3f/0x41, codigos que o
+ // keymatrixmap[] nao conhece (linha 0x00) -- ou seja, F2/F4/F6/F8 nao
+ // faziam absolutamente nada.
+   75,78,0x00,0x00,0x00,
+   0x3a, 0x2000|0x3a, 0x3c, 0x2000|0x3c, 0x3e, 0x2000|0x3e, 0x40, 0x2000|0x40,
+   0x00,0x00,0x00,  // 128-143
  //     145:up                                                      157:left
    0x00,0x2051,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x204f,0x00,0x00   // 144-159
 };
