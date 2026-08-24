@@ -41,6 +41,7 @@
 #include "vic.h"
 #include "cia1.h"
 #include "cia2.h"
+#include "sidlite.h"
 
 
 extern CONSTROM rarray_t PLA_READ[8];
@@ -51,11 +52,7 @@ uint8_t r_bas(uint32_t address)		{ return rom_basic[address & (sizeof(rom_basic)
 uint8_t r_ker(uint32_t address)		{ return rom_kernal[address & (sizeof(rom_kernal)-1)]; } //KERNAL ROM
 uint8_t r_chr(uint32_t address)		{ return rom_characters[address & (sizeof(rom_characters)-1)]; } //CHARACTER ROM
 uint8_t r_vic(uint32_t address)		{ return vic_read(address); }
-#ifdef HAS_SND      
-uint8_t r_sid(uint32_t address)		{ return playSID.getreg(address & 0x1F);}
-#else
-uint8_t r_sid(uint32_t address)		{ return 0;}
-#endif
+uint8_t r_sid(uint32_t address)		{ return sidlite_read(address); }
 uint8_t r_col(uint32_t address)		{ return cpu.vic.COLORRAM[address & 0x3FF]; }
 uint8_t r_cia1(uint32_t address)	{ return cia1_read(address); }
 uint8_t r_cia2(uint32_t address)	{ return cia2_read(address); }
@@ -77,11 +74,7 @@ void w_ramz( uint32_t address, uint8_t value )	{
 	} 
 void w_vic( uint32_t address, uint8_t value )	{ vic_write(address, value); }
 void w_col( uint32_t address, uint8_t value )	{ cpu.vic.COLORRAM[address & 0x3FF] = value & 0x0F;}
-#ifdef HAS_SND      
-void w_sid( uint32_t address, uint8_t value )	{ playSID.setreg(address & 0x1F, value); }
-#else
-void w_sid( uint32_t address, uint8_t value )	{ }
-#endif
+void w_sid( uint32_t address, uint8_t value )	{ sidlite_write(address, value); }
 void w_cia1( uint32_t address, uint8_t value )	{ cia1_write(address, value); }
 void w_cia2( uint32_t address, uint8_t value )	{ cia2_write(address, value); }
 

@@ -12,8 +12,7 @@ extern "C" {
 #endif
 
 #ifdef HAS_SND
-#include "reSID.h"
-AudioPlaySID playSID;
+#include "sidlite.h"
 #endif
 
 using namespace std;
@@ -334,6 +333,7 @@ void c64_Init(void)
   resetCia1();
   resetCia2();
   resetVic();
+  sidlite_init();
   cpu_reset(); 
 }
 
@@ -371,6 +371,6 @@ void c64_Input(int bClick) {
 #ifdef HAS_SND      
 void  SND_Process( void * stream, int len )
 {
-    playSID.update(stream, len);
+    sidlite_fill((int16_t *)stream, len);
 }
 #endif

@@ -2544,7 +2544,7 @@ OPCODE void opPATCHF2(void) {
 
 typedef void (*op_ptr_t)( void );
 
-static const op_ptr_t opcodetable[256] = {
+DRAM_ATTR static const op_ptr_t opcodetable[256] = {
   /*        	0   	1   	2   	3   	4   	5   	6   	7   	8	   9   		A   	B   	C   	D   	E   	F */
   /* 0  */    op0x0 , op0x1,  opKIL , op0x3,  op0x4 , op0x5,  op0x6,  op0x7,  op0x8,  op0x9,  op0xA,  op0xB , op0xC , op0xD , op0xE , op0xF,
   /* 1  */    op0x10, op0x11, opKIL , op0x13, op0x14, op0x15, op0x16, op0x17, op0x18, op0x19, op0x1A, op0x1B, op0x1C, op0x1D, op0x1E, op0x1F,
@@ -2564,7 +2564,7 @@ static const op_ptr_t opcodetable[256] = {
   /* F  */    op0xF0, op0xF1, opPATCHF2 , op0xF3, op0xF4, op0xF5, op0xF6, op0xF7, op0xF8, op0xF9, op0xFA, op0xFB, op0xFC, op0xFD, op0xFE, op0xFF
 };
 
-static const uint8_t cyclesTable[256] =
+DRAM_ATTR static const uint8_t cyclesTable[256] =
 {
 	7, 6, 2, 8, 3, 3, 5, 5, 3, 2, 2, 2, 4, 4, 6, 6,  // $00
 	2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 5, 5, 7, 7,  // $10
@@ -2584,7 +2584,7 @@ static const uint8_t cyclesTable[256] =
 	2, 5, 2, 8, 4, 4, 6, 6, 2, 4, 2, 7, 5, 5, 7, 7   // $F0
 };
 
-static const uint8_t writeCycleTable[256] =
+DRAM_ATTR static const uint8_t writeCycleTable[256] =
 {
     3, 0, 0, 2, 0, 0, 2, 2, 1, 0, 0, 0, 0, 0, 2, 2, // $00
     0, 0, 0, 2, 0, 0, 2, 2, 0, 0, 0, 2, 0, 0, 2, 2, // $10
@@ -2644,7 +2644,7 @@ void cia_clockt(int ticks) {
 	cia2_clock(ticks);
 }
 
-void cpu_clock(int cycles) {
+IRAM_ATTR void cpu_clock(int cycles) {
 static int c = 0;
 static int writeCycles = 0;
 	cpu.lineCyclesAbs += cycles;

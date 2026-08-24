@@ -41,7 +41,7 @@
 
 #define INLINE 			static inline __attribute__((always_inline))
 #define INLINEOP 		static inline __attribute__((always_inline, flatten))
-#define OPCODE			static
+#define OPCODE			static IRAM_ATTR
 
 #define RAMSIZE 		65536	//Bytes
 
