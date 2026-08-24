@@ -32,6 +32,10 @@ int ps2kbd_get_joy_mode(void);
 
 #include "c64.h"
 
+/* ---- INSTRUMENTACAO TEMPORARIA (remover depois de medir) ---------------- */
+extern "C" void c64_GetPerfStats(uint32_t *lineCyc, uint8_t *spr);
+extern volatile uint32_t g_cpuCycAcc;   /* definido em cpu.cpp */
+
 
 VGA_Video video;
 
@@ -430,11 +434,26 @@ void emu_loop(void)
       unsigned long long flushUs = 0;
       vga_get_stats(&frames, &flushUs);
       double secs = (double)(tnow - tStat) / 1000000.0;
+
+      /* Custo do VIC x custo do 6502. c64_GetPerfStats() devolve os ciclos
+         de CPU gastos na linha inteira; g_cpuCycAcc (em cpu.cpp) devolve os
+         gastos dentro do cpu_clock(). A diferenca e' o VIC puro. */
+      uint32_t lineCyc = 0, cpuCyc = 0;
+      uint8_t  spr = 0;
+      c64_GetPerfStats(&lineCyc, &spr);
+      cpuCyc = g_cpuCycAcc; g_cpuCycAcc = 0;
+      double totalCyc = 240000000.0 * secs;
+      double pctCpu = 100.0 * (double)cpuCyc  / totalCyc;
+      double pctVic = 100.0 * (double)lineCyc / totalCyc - pctCpu;
+      if (pctVic < 0.0) pctVic = 0.0;
+
       printf("[PERF] linhas/s=%.0f (esperado 15600)  quadros/s=%.1f (esperado 50)"
-             "  conv=%.1f%% da CPU  heap=%u\n",
+             "  vic=%.1f%%  6502=%.1f%%  spr=$%02X  conv=%.1f%% da CPU  heap=%u\n",
              steps / secs, frames / secs,
+             pctVic, pctCpu, spr,
              100.0 * (double)flushUs / (double)(tnow - tStat),
              (unsigned)esp_get_free_heap_size());
+ 
       fflush(stdout);
       steps = 0;
       tStat = tnow;

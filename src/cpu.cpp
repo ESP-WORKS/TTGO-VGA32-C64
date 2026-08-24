@@ -2644,7 +2644,14 @@ void cia_clockt(int ticks) {
 	cia2_clock(ticks);
 }
 
+/* ---- INSTRUMENTACAO TEMPORARIA (remover depois de medir) ----------------
+   Acumula os ciclos de CPU gastos DENTRO do cpu_clock(). O c64.cpp mede o
+   total da linha de raster; a diferenca entre os dois e' o custo do VIC.
+   Lido e zerado pelo bloco [PERF] do go.cpp. */
+volatile uint32_t g_cpuCycAcc = 0;
+
 IRAM_ATTR void cpu_clock(int cycles) {
+	uint32_t _t0 = get_ccount();
 static int c = 0;
 static int writeCycles = 0;
 	cpu.lineCyclesAbs += cycles;
@@ -2685,6 +2692,7 @@ noOpcode:
 
 	};
 
+	g_cpuCycAcc += get_ccount() - _t0;
 	return;
 }
 

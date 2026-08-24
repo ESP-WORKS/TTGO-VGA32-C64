@@ -31,6 +31,12 @@ static bool     vgaReady = false;
 static uint16_t lineScratch[VGA_XRES] __attribute__((aligned(4)));
 static int      pendingLine = -1;
 
+// Mapa dx(0..279) -> src_x(0..319) da compressao horizontal, pre-calculado em
+// begin(). Antes essa conta era feita por pixel dentro da flushLine:
+//   src_x = (dx * VGA_XRES) / VGA_CONTENT_XRES
+// 280 divisoes por linha x 15600 linhas/s. Agora e' uma leitura de tabela.
+static uint16_t srcMap[VGA_CONTENT_XRES];
+
 // Contadores de desempenho.
 static unsigned long      s_frames  = 0;   // quadros do VIC-II
 static unsigned long long s_flushUs = 0;   // tempo total convertendo linhas
@@ -86,24 +92,29 @@ static void IRAM_ATTR flushLine(int y)
   // padrao caia para preto, etc).
   uint8_t borderRaw = lut[vic_get_border_color() & 0x3F];
 
-  // Left border: 20 pixels
-  for (int x = 0; x < VGA_BORDER_WIDTH; x++) {
-    fb_line[(x ^ 2)] = borderRaw;
-  }
+  // Bordas: como a cor e' uniforme, o swizzle x^2 nao importa -- todos os
+  // bytes do intervalo recebem o mesmo valor. memset em vez de laco.
+  memset(fb_line, borderRaw, VGA_BORDER_WIDTH);
+  memset(fb_line + VGA_XRES - VGA_BORDER_WIDTH, borderRaw, VGA_BORDER_WIDTH);
 
-  // Center: scale/compress 320 -> VGA_CONTENT_XRES (280)
-  // Mapeia conteúdo do C64 (0..319) para área comprimida (20..299)
-  for (int dx = 0; dx < VGA_CONTENT_XRES; dx++) {
-    int src_x = (dx * VGA_XRES) / VGA_CONTENT_XRES;  // map compressed coord -> source
-    if (src_x >= VGA_XRES) src_x = VGA_XRES - 1;
-    uint8_t raw = lut[lineScratch[src_x] & 0x3F];
-    int dst_x = VGA_BORDER_WIDTH + dx;
-    fb_line[(dst_x ^ 2)] = raw;
-  }
-
-  // Right border: 20 pixels
-  for (int x = VGA_XRES - VGA_BORDER_WIDTH; x < VGA_XRES; x++) {
-    fb_line[(x ^ 2)] = borderRaw;
+  // Centro: 320 -> 280, quatro pixels por store de 32 bits.
+  //
+  // O swizzle x^2 embaralha DENTRO de cada grupo de 4 bytes alinhado: os
+  // pixels 0,1,2,3 vao para as posicoes 2,3,0,1. Como VGA_BORDER_WIDTH (20)
+  // e VGA_CONTENT_XRES (280) sao ambos multiplos de 4, o centro cai exatamente
+  // em palavras alinhadas e da' para montar cada uma na ordem certa e gravar
+  // de uma vez. ESP32 e' little-endian: byte 0 da palavra = menor endereco.
+  {
+    uint32_t *fb32 = (uint32_t *)fb_line + (VGA_BORDER_WIDTH / 4);
+    const uint16_t *sm = srcMap;
+    for (int w = 0; w < VGA_CONTENT_XRES / 4; w++) {
+      uint32_t p0 = lut[lineScratch[sm[0]] & 0x3F];
+      uint32_t p1 = lut[lineScratch[sm[1]] & 0x3F];
+      uint32_t p2 = lut[lineScratch[sm[2]] & 0x3F];
+      uint32_t p3 = lut[lineScratch[sm[3]] & 0x3F];
+      sm += 4;
+      fb32[w] = p2 | (p3 << 8) | (p0 << 16) | (p1 << 24);
+    }
   }
 
   // Overlay do indicador "DISK" -- desenhado por cima da borda inferior. So'
@@ -180,6 +191,14 @@ void VGA_Video::begin(void)
   memset(_fb, _rawLUT[0], VGA_XRES * VGA_YRES);
 
   memset(lineScratch, 0, sizeof(lineScratch));
+
+  // Mapa da compressao horizontal, calculado uma vez.
+  for (int dx = 0; dx < VGA_CONTENT_XRES; dx++) {
+    int src_x = (dx * VGA_XRES) / VGA_CONTENT_XRES;
+    if (src_x >= VGA_XRES) src_x = VGA_XRES - 1;
+    srcMap[dx] = (uint16_t)src_x;
+  }
+
   vgaReady = true;
 
   Serial.printf("[VGA] pronto. Compensacao horizontal: 320->280px, borda do VIC ($D020).\n");

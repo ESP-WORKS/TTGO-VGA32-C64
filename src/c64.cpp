@@ -17,6 +17,24 @@ extern "C" {
 
 using namespace std;
 
+/* ---- INSTRUMENTACAO TEMPORARIA (remover depois de medir) ----------------
+   vic_do() dirige o 6502 por dentro (cpu_clock() espalhado pela funcao, e'
+   assim que o VIC rouba ciclo em badline). Entao cronometrar vic_do() daria
+   ~100% e nao separaria nada.
+
+   Aqui medimos o TOTAL da linha; o cpu.cpp mede o que foi gasto dentro do
+   cpu_clock(). A subtracao no go.cpp da' o custo do VIC puro.
+
+   vicSprSeen acumula (OR) o $D015, o registrador de sprites ligados: cada
+   bit em 1 e' um sprite que esteve ativo em algum momento da janela. */
+volatile uint32_t g_lineCycAcc = 0;
+volatile uint8_t  g_vicSprSeen = 0;
+
+extern "C" void c64_GetPerfStats(uint32_t *lineCyc, uint8_t *spr) {
+  *lineCyc = g_lineCycAcc; g_lineCycAcc = 0;
+  *spr     = g_vicSprSeen; g_vicSprSeen = 0;
+}
+
 /* IRAM_ATTR */
 static void oneRasterLine(void) {
   static unsigned short lc = 1;
@@ -26,11 +44,14 @@ static void oneRasterLine(void) {
     cpu.lineStartTime = get_ccount();
     cpu.lineCycles = cpu.lineCyclesAbs = 0;
 
+    uint32_t _tLine = get_ccount();
     if (!cpu.exactTiming) {
     vic_do();
   } else {
     vic_do_simple();
   }
+    g_lineCycAcc += get_ccount() - _tLine;
+    g_vicSprSeen |= cpu.vic.R[0x15];
 
     if (--lc == 0) {
       lc = LINEFREQ / 10; // 10Hz
@@ -189,7 +210,7 @@ static inline uint16_t heldScancode(void) {
   static int lastK = 0;
   if (k != lastK) {
     lastK = k;
-    if (k) printf("[held] ascii=%d -> scancode=$%04X\n", k, sc);
+    //if (k) printf("[held] ascii=%d -> scancode=$%04X\n", k, sc);
   }
   return sc;
 }

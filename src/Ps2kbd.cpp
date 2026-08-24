@@ -201,9 +201,9 @@ static void ps2kbd_poll(void)
   static uint32_t lastStat = 0;
   if (millis() - lastStat > 2000) {
     lastStat = millis();
-    Serial.printf("[PS2] poll vivo | disponivel=%d vk=%d\n",
-                  (int)kb->isKeyboardAvailable(),
-                  (int)kb->virtualKeyAvailable());
+  //  Serial.printf("[PS2] poll vivo | disponivel=%d vk=%d\n",
+  //                (int)kb->isKeyboardAvailable(),
+  //                (int)kb->virtualKeyAvailable());
   }
 #endif
 
@@ -212,8 +212,8 @@ static void ps2kbd_poll(void)
     fabgl::VirtualKey vk = kb->getNextVirtualKey(&down);
 
 #if PS2_TRACE
-    Serial.printf("[PS2] vk=%d down=%d ascii=%d\n",
-                  (int)vk, (int)down, (int)kb->virtualKeyToASCII(vk));
+//    Serial.printf("[PS2] vk=%d down=%d ascii=%d\n",
+//                  (int)vk, (int)down, (int)kb->virtualKeyToASCII(vk));
 #endif
 
     // F12 cicla o modo joystick: OFF -> J1 -> J2 -> OFF.
@@ -374,9 +374,9 @@ void ps2kbd_begin(void)
   // keyboard() devolve o objeto mesmo sem teclado ligado, entao "iniciado"
   // sozinho nao prova nada. isKeyboardAvailable() diz se o dispositivo
   // respondeu ao reset do protocolo.
-  Serial.printf("[PS2] objeto=%s  dispositivo=%s\n",
-                kb ? "ok" : "nulo",
-                (kb && kb->isKeyboardAvailable()) ? "DETECTADO" : "nao responde");
+  //Serial.printf("[PS2] objeto=%s  dispositivo=%s\n",
+  //              kb ? "ok" : "nulo",
+  //              (kb && kb->isKeyboardAvailable()) ? "DETECTADO" : "nao responde");
   Serial.flush();
 }
 
