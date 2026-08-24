@@ -178,6 +178,14 @@ static uint16_t joyMaskOf(fabgl::VirtualKey vk) {
 
 // Drena a fila da FabGL. Chamada pelos dois getters, entao o teclado responde
 // tanto no menu quanto em jogo.
+// Contador de ciclos do nucleo: uma instrucao, sem dependencia de header.
+static inline uint32_t ps2_ccount(void)
+{
+  uint32_t r;
+  asm volatile ("rsr %0, ccount" : "=r"(r));
+  return r;
+}
+
 static void ps2kbd_poll(void)
 {
   if (!kbdReady) return;
@@ -188,10 +196,17 @@ static void ps2kbd_poll(void)
   // centenas de milhares de vezes por segundo, entrando na secao critica da
   // FabGL a cada vez. 1 ms de granularidade e' de sobra para um teclado
   // (o menu le a 20 ms e o jogo a 20 ms).
-  static uint32_t lastPollUs = 0;
-  uint32_t nowUs = micros();
-  if ((uint32_t)(nowUs - lastPollUs) < 1000) return;
-  lastPollUs = nowUs;
+  // O corte usa o contador de ciclos do nucleo (get_ccount), nao micros().
+  // micros() e' esp_timer_get_time(): leitura de contador de 64 bits com
+  // sequencia de latch, dezenas de ciclos -- e ela acontecia ANTES do corte,
+  // ou seja, era paga em todas as centenas de milhares de chamadas por
+  // segundo descritas acima. O ccount e' uma unica instrucao (RSR).
+  // A 240 MHz, 1 ms = 240000 ciclos. O contador da' a volta a cada ~17,9 s,
+  // mas a subtracao em uint32 continua correta na volta.
+  static uint32_t lastPollCyc = 0;
+  uint32_t nowCyc = ps2_ccount();
+  if ((uint32_t)(nowCyc - lastPollCyc) < 240000u) return;
+  lastPollCyc = nowCyc;
 
   fabgl::Keyboard *kb = ps2.keyboard();
   if (!kb) return;
