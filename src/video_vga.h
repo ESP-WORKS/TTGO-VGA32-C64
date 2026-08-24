@@ -53,6 +53,13 @@ extern "C" {
 #endif
 uint16_t vic_get_border_color(void);
 
+// Converte um indice de cor RGB222 de 6 bits para o byte RAW que a FabGL
+// espera no framebuffer. Usado pelo installPalette() do vic.cpp para que a
+// paleta do VIC ja' guarde valores crus -- assim a flushLine nao precisa
+// consultar o LUT por pixel (280 leituras a menos por linha).
+// So' e' valido depois de VGA_Video::begin(); antes disso devolve 0.
+uint8_t vga_raw_from_c6(uint8_t c6);
+
 // Indicador de acesso a "disco" estilo Apple ][. Chamado por patches.cpp
 // quando um LOAD e' interceptado. A mensagem aparece no canto inferior
 // esquerdo por ~2 segundos (esse tempo e' contado internamente em ms).

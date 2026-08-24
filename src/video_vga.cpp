@@ -55,6 +55,13 @@ static uint32_t s_diskNow      = 0;   // atualizado uma vez por quadro
 #define DISK_TEXT_X 4
 
 
+uint8_t vga_raw_from_c6(uint8_t c6)
+{
+  if (!vgaReady) return 0;
+  return _rawLUT[c6 & 0x3F];
+}
+
+
 void vga_show_disk(const char *msg, int ms)
 {
   if (!msg) { s_diskMsg[0] = 0; s_diskDeadline = 0; return; }
@@ -90,7 +97,9 @@ static void IRAM_ATTR flushLine(int y)
   // -- entao usamos direto como indice do LUT, sem passar pelo vga_rgb565to6.
   // Antes eu chamava vga_rgb565to6() aqui e a cor saia lixo (borda azul
   // padrao caia para preto, etc).
-  uint8_t borderRaw = lut[vic_get_border_color() & 0x3F];
+  // A paleta do VIC ja' guarda o byte RAW (ver installPalette em vic.cpp),
+  // entao a cor da borda vem pronta -- nada de LUT nem de mascara aqui.
+  uint8_t borderRaw = (uint8_t)vic_get_border_color();
 
   // Bordas: como a cor e' uniforme, o swizzle x^2 nao importa -- todos os
   // bytes do intervalo recebem o mesmo valor. memset em vez de laco.
@@ -108,10 +117,11 @@ static void IRAM_ATTR flushLine(int y)
     uint32_t *fb32 = (uint32_t *)fb_line + (VGA_BORDER_WIDTH / 4);
     const uint16_t *sm = srcMap;
     for (int w = 0; w < VGA_CONTENT_XRES / 4; w++) {
-      uint32_t p0 = lut[lineScratch[sm[0]] & 0x3F];
-      uint32_t p1 = lut[lineScratch[sm[1]] & 0x3F];
-      uint32_t p2 = lut[lineScratch[sm[2]] & 0x3F];
-      uint32_t p3 = lut[lineScratch[sm[3]] & 0x3F];
+      // Sem lut[]: o scratch ja' contem bytes RAW.
+      uint32_t p0 = lineScratch[sm[0]] & 0xFF;
+      uint32_t p1 = lineScratch[sm[1]] & 0xFF;
+      uint32_t p2 = lineScratch[sm[2]] & 0xFF;
+      uint32_t p3 = lineScratch[sm[3]] & 0xFF;
       sm += 4;
       fb32[w] = p2 | (p3 << 8) | (p0 << 16) | (p1 << 24);
     }
