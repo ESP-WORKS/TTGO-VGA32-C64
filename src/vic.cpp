@@ -1973,6 +1973,21 @@ void installPalette(void) {
   for (unsigned i = 0; i < sizeof(cpu.vic.palette)/sizeof(cpu.vic.palette[0]); i++) {
     cpu.vic.palette[i] = vga_raw_from_c6((uint8_t)palette[i]);
   }
+
+  // colors[] TEM de sair daqui tambem. O resetVic() faz memset em cpu.vic
+  // inteiro, e so' o vic_write() repovoa colors[] -- ou seja, entre o reset e
+  // a primeira escrita do jogo em $D020..$D02E o vetor fica todo em zero.
+  //
+  // Isso era inofensivo enquanto a flushLine passava a cor pelo LUT: lut[0]
+  // devolvia preto COM os bits de sincronismo. Agora o valor vai cru para o
+  // framebuffer, e 0x00 nao tem bits de sync -- o monitor perde o sinal e
+  // leva segundos para re-sincronizar (o que aparecia como "a tela do C64
+  // demora a entrar" depois de escolher um jogo no menu).
+  //
+  // Preto e' o valor certo para o estado inicial; e' o indice 0 da paleta.
+  for (unsigned i = 0; i < sizeof(cpu.vic.colors)/sizeof(cpu.vic.colors[0]); i++) {
+    cpu.vic.colors[i] = cpu.vic.palette[0];
+  }
 }
 
 
