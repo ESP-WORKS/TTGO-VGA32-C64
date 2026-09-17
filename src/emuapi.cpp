@@ -26,6 +26,9 @@ extern "C" {
 #include <dirent.h>
 #include <sys/stat.h>
 #include <driver/adc.h>
+#include <stdlib.h>          // qsort, malloc/realloc/free
+#include <strings.h>         // strcasecmp
+#include "esp_timer.h"       // ritmo de auto-repeat do menu
 
 // Aliases legadas caso a versao da IDF nao as exponha mais.
 #ifndef HSPI_HOST
@@ -66,7 +69,8 @@ static const uint16_t * logo = deflogo;
 
 #define CALIBRATION_FILE    "/sdcard/cal.cfg"
 
-#define MAX_FILENAME_SIZE   28
+#define MAX_FILENAME_SIZE   28    // largura de EXIBICAO, em caracteres
+#define MENU_NAME_MAXLEN    63    // tamanho maximo do nome REAL do arquivo
 
 // Fonte do menu: 8x8 (doublesize=false), nao mais 8x16. Com isso cabem bem
 // mais linhas na tela sem precisar rolar tanto -- MAX_MENULINES nao depende
@@ -97,17 +101,14 @@ static bool menuRedraw=true;
 static int nbFiles=0;
 static int curFile=0;
 static int topFile=0;
-static char selection[MAX_FILENAME_SIZE+1]="";
+// Nome do item selecionado. Guardado INTEIRO (ate MENU_NAME_MAXLEN), nao
+// truncado em MAX_FILENAME_SIZE -- este ultimo e' so' a largura de EXIBICAO.
+// Antes um arquivo com nome longo aparecia cortado na tela e o corte ia junto
+// para o emu_FileOpen(), que entao nao achava o arquivo.
+static char selection[MENU_NAME_MAXLEN+1]="";
+static bool selIsDir=false;
 static uint8_t prev_zt=0; 
 
-// Cache dos nomes visiveis na pagina atual. Existe para o redesenho parcial:
-// quando o cursor anda dentro da mesma pagina, so' precisamos redesenhar as
-// duas linhas que trocaram (a antiga volta ao normal, a nova recebe o
-// destaque). Sem isso a tela inteira era relida do SD e redesenhada a cada
-// tecla, e a lista "piscava" a cada seta -- exatamente o efeito ruim que o
-// usuario reportou.
-static char pageNames[MAX_MENULINES][MAX_FILENAME_SIZE+1];
-static int  pageCount   = 0;    // quantos slots de pageNames[] estao validos
 static int  prevCurFile = -1;   // -1 = ainda nao desenhamos nada
 
 // "._Nome" e' o arquivo de recurso (AppleDouble) que o macOS cria toda vez
@@ -118,36 +119,149 @@ static inline bool isJunkFile(const char *name) {
   return (name[0] == '.' && name[1] == '_');
 }
 
-static int readNbFiles(void) {
-  int totalFiles = 0;
+// ===== Catalogo de arquivos ==============================================
+//
+// O diretorio e' lido UMA vez ao abrir a pasta, ordenado e mantido em RAM
+// INTERNA (esta placa nao tem PSRAM). "Ler tudo de uma vez" parece caro, mas
+// e' o caminho RAPIDO: enumerar um diretorio e' leitura sequencial de alguns
+// setores (nao e' abrir/ler cada arquivo) e roda UMA vez por pasta. O lento
+// era o codigo antigo -- relia o diretorio a cada troca de pagina e ainda
+// chamava stat() a cada quadro.
+//
+// Para caber na RAM interna, sem PSRAM:
+//   - o buffer de nomes CRESCE sob demanda (realloc), usando so' o que a
+//     pasta precisa -- tipicamente poucos KB, nao um bloco fixo enorme;
+//   - o catalogo e' LIBERADO quando um jogo comeca a rodar (menu_freeCatalog),
+//     devolvendo a RAM ao emulador, e relido quando o menu reabre.
+// Guardamos so' um offset (uint16) + flag por arquivo; o nome vive uma vez
+// so' na arena. Organizar as ROMs em subpastas mantem cada dir pequeno.
+
+#define MENU_MAX_FILES      2000
+#define MENU_ARENA_CAP      (60*1024)   // < 64KB: offset cabe em uint16_t
+
+typedef struct {
+  uint16_t off;    // deslocamento do nome dentro de menuArena
+  uint8_t  isDir;
+} MenuEntry;
+
+static MenuEntry *menuEntries    = NULL;
+static uint32_t   menuEntriesCap = 0;    // capacidade atual (entradas)
+static char      *menuArena      = NULL; // nomes empacotados, '\0' entre eles
+static uint32_t   menuArenaCap   = 0;
+static uint32_t   menuArenaUsed  = 0;
+static bool       catalogLoaded  = false;
+static char       romsbase[64]   = "";   // raiz das ROMs -- limite do ".."
+
+#define ENTRY_NAME(i)  (menuArena + menuEntries[i].off)
+
+static inline bool menu_isUpEntry(const char *n) {
+  return (n[0]=='.' && n[1]=='.' && n[2]==0);
+}
+
+static int menu_cmpEntry(const void *a, const void *b) {
+  const MenuEntry *ea = (const MenuEntry*)a;
+  const MenuEntry *eb = (const MenuEntry*)b;
+  const char *na = menuArena + ea->off;
+  const char *nb = menuArena + eb->off;
+  bool ua = menu_isUpEntry(na), ub = menu_isUpEntry(nb);
+  if (ua != ub) return ua ? -1 : 1;                       // ".." no topo
+  if (ea->isDir != eb->isDir) return ea->isDir ? -1 : 1;  // pastas antes
+  return strcasecmp(na, nb);                              // A-Z sem case
+}
+
+// Libera o catalogo. Chamado ao rodar um jogo (devolve RAM ao emulador) e no
+// inicio de cada rescan.
+void menu_freeCatalog(void) {
+  free(menuEntries); menuEntries = NULL; menuEntriesCap = 0;
+  free(menuArena);   menuArena   = NULL; menuArenaCap   = 0;
+  menuArenaUsed = 0;
+  nbFiles = 0;
+  catalogLoaded = false;
+}
+
+// Garante espaco para +1 entrada e +nameLen bytes de nome, dobrando os
+// buffers quando preciso. false = estourou o teto (RAM ou MENU_ARENA_CAP).
+// Como as entradas guardam OFFSET (nao ponteiro), o realloc da arena pode
+// mover a memoria sem invalidar nada.
+static bool menu_reserve(uint32_t nameLen) {
+  if ((uint32_t)nbFiles + 1 > menuEntriesCap) {
+    uint32_t cap = menuEntriesCap ? menuEntriesCap * 2 : 128;
+    if (cap > MENU_MAX_FILES) cap = MENU_MAX_FILES;
+    if ((uint32_t)nbFiles + 1 > cap) return false;
+    MenuEntry *p = (MenuEntry*)realloc(menuEntries, cap * sizeof(MenuEntry));
+    if (!p) return false;
+    menuEntries = p; menuEntriesCap = cap;
+  }
+  if (menuArenaUsed + nameLen + 1 > menuArenaCap) {
+    uint32_t cap = menuArenaCap ? menuArenaCap : 4096;
+    while (cap < menuArenaUsed + nameLen + 1) cap *= 2;
+    if (cap > MENU_ARENA_CAP) cap = MENU_ARENA_CAP;
+    if (menuArenaUsed + nameLen + 1 > cap) return false;
+    char *p = (char*)realloc(menuArena, cap);
+    if (!p) return false;
+    menuArena = p; menuArenaCap = cap;
+  }
+  return true;
+}
+
+static void menu_addEntry(const char *name, bool isDir) {
+  uint32_t len = strlen(name);
+  if (len > MENU_NAME_MAXLEN) len = MENU_NAME_MAXLEN;
+  if (!menu_reserve(len)) return;   // teto atingido: ignora o resto
+  uint16_t off = (uint16_t)menuArenaUsed;
+  memcpy(menuArena + off, name, len);
+  menuArena[off + len] = 0;
+  menuArenaUsed += len + 1;
+  menuEntries[nbFiles].off   = off;
+  menuEntries[nbFiles].isDir = isDir ? 1 : 0;
+  nbFiles++;
+}
+
+// Le romspath inteiro (uma passada) e ordena. So' no boot, na troca de pasta
+// e ao reabrir o menu -- nunca entre teclas.
+static int menu_rescan(void) {
+  menu_freeCatalog();
+
+  // Aviso de leitura: numa pasta com centenas de arquivos a varredura leva
+  // uns instantes. Some assim que a lista e' desenhada por cima.
+  video.drawTextNoDma(MENU_FILE_XOFFSET, MENU_FOOTER_YOFFSET,
+                      "Lendo cartao...", RGBVAL16(0xff,0xff,0x00),
+                      RGBVAL16(0x00,0x00,0x00), false);
+
+  // ".." quando nao estamos na raiz de ROMs.
+  if (romsbase[0] && strcmp(romspath, romsbase) != 0)
+    menu_addEntry("..", true);
 
   DIR* dir = opendir(romspath);
   if (!dir) {
-    // Sem esta checagem o readdir(NULL) causa LoadProhibited. Acontece
-    // quando o diretorio nao existe no cartao.
+    // Sem esta checagem o readdir(NULL) causa LoadProhibited.
     printf("ERRO: nao consegui abrir %s (o diretorio existe no SD?)\n", romspath);
-    return 0;
+    catalogLoaded = true;   // catalogo valido, so' vazio
+    return nbFiles;
   }
-  while (true) {
-    struct dirent* de = readdir(dir);
-    if (!de) {
-      // no more files
-      break;
-    }    
+  struct dirent* de;
+  while ((de = readdir(dir)) != NULL && nbFiles < MENU_MAX_FILES) {
     if (isJunkFile(de->d_name)) continue;
-    if (de->d_type == DT_REG) {
-      totalFiles++;
+    if (de->d_type == DT_DIR) {
+      if (!strcmp(de->d_name,".") || !strcmp(de->d_name,"..")) continue;
+      menu_addEntry(de->d_name, true);
+    } else if (de->d_type == DT_REG) {
+      menu_addEntry(de->d_name, false);
     }
-    else if (de->d_type == DT_DIR) {
-      if ( (strcmp(de->d_name,".")) && (strcmp(de->d_name,"..")) ) {
-        totalFiles++;
-      }
-    }  
   }
   closedir(dir);
-  printf("Directory read: %d files",totalFiles);
-  return totalFiles;  
+
+  qsort(menuEntries, nbFiles, sizeof(MenuEntry), menu_cmpEntry);
+  catalogLoaded = true;
+  printf("Catalogo: %d entradas em %s (%u/%u bytes de nomes)\n",
+         nbFiles, romspath, (unsigned)menuArenaUsed, (unsigned)menuArenaCap);
+  return nbFiles;
 }
+
+// Protótipo: menu_setSelection() e' definido junto do resto do desenho do
+// menu, mais abaixo, mas toggleMenu() (acima daquele ponto) ja' o chama ao
+// recarregar o catalogo. Sem esta linha o compilador para em toggleMenu.
+static void menu_setSelection(void);
 
 static char captureTouchZone(const unsigned short * areas, const unsigned short * actions, int *rx, int *ry, int *rw, int * rh) {
     uint16_t xt=0;
@@ -232,7 +346,10 @@ void toggleMenu(bool on) {
     prevCurFile=-1;   // invalida cache: a proxima chamada faz redraw full
     video.fillScreenNoDma(RGBVAL16(0x00,0x00,0x00));
     // false = fonte pequena (8x8), igual ao resto do menu agora.
-    video.drawTextNoDma(0,0, TITLE, RGBVAL16(0x00,0xff,0xff), RGBVAL16(0x00,0x00,0xff), false);  
+    video.drawTextNoDma(0,0, TITLE, RGBVAL16(0x00,0xff,0xff), RGBVAL16(0x00,0x00,0xff), false);
+    // Recarrega o catalogo se foi liberado ao rodar o ultimo jogo. No boot
+    // ele ja' esta carregado (emu_init), entao aqui nao ha leitura dupla.
+    if (!catalogLoaded) { menu_rescan(); menu_setSelection(); }
   } else {
     menuOn = false;    
   }
@@ -364,52 +481,63 @@ bool menuActive(void)
 // ----- Redesenho parcial do menu -----------------------------------------
 //
 // A pagina e' fixa: topFile = (curFile / MAX_MENULINES) * MAX_MENULINES.
-// O cursor anda de 1 em 1 dentro da pagina; quando cruza a borda, a pagina
-// inteira e' trocada. Isso substitui o scroll centralizado antigo, que
-// mudava topFile a cada seta.
+// O cursor anda de 1 em 1 dentro da pagina e so' as DUAS linhas que trocaram
+// sao redesenhadas. A pagina inteira so' e' repintada quando o cursor cruza
+// a borda -- 1 vez a cada 24 teclas.
 
-static void menu_drawLine(int row, const char *name, bool highlight)
+static void menu_drawLine(int row, const char *name, bool isDir, bool highlight)
 {
-  uint16_t fg = highlight ? RGBVAL16(0xff,0xff,0x00) : MENU_FILE_FGCOLOR;
-  uint16_t bg = highlight ? RGBVAL16(0xff,0x00,0x00) : MENU_FILE_BGCOLOR;
-  // Limpa a linha antes de escrever: sem isso o nome antigo (quando mais
-  // longo que o novo) deixa "restos" a direita. Tambem serve para trocar o
-  // fundo entre azul/vermelho no redesenho parcial.
-  video.drawRectNoDma(MENU_FILE_XOFFSET,
-                      row*TEXT_HEIGHT + MENU_FILE_YOFFSET,
-                      MENU_FILE_W, TEXT_HEIGHT, bg);
+  char text[MAX_FILENAME_SIZE+2];
+  uint16_t fg = MENU_FILE_FGCOLOR;
+  uint16_t bg = MENU_FILE_BGCOLOR;
+
+  if (name == NULL) {
+    // Linha vazia (fim da lista numa pagina incompleta).
+    memset(text, ' ', MAX_FILENAME_SIZE);
+    text[MAX_FILENAME_SIZE] = 0;
+  } else {
+    if (isDir) {
+      // Pastas com "/" na frente e em verde: da' pra distinguir de um .prg
+      // de relance, sem precisar entrar para descobrir.
+      snprintf(text, sizeof(text), "/%-*.*s",
+               MAX_FILENAME_SIZE-1, MAX_FILENAME_SIZE-1, name);
+      fg = RGBVAL16(0x60,0xff,0x60);
+    } else {
+      snprintf(text, sizeof(text), "%-*.*s",
+               MAX_FILENAME_SIZE, MAX_FILENAME_SIZE, name);
+    }
+    if (highlight) { fg = RGBVAL16(0x00,0x00,0x00); bg = RGBVAL16(0xff,0xc0,0x00); }
+  }
+
+  // O texto ja' vem preenchido com espacos ate' a largura fixa, e o
+  // drawTextNoDma pinta o fundo do glifo -- entao a linha inteira e' repintada
+  // pela propria escrita (uma passada de video por linha, nao duas).
   video.drawTextNoDma(MENU_FILE_XOFFSET,
                       row*TEXT_HEIGHT + MENU_FILE_YOFFSET,
-                      name, fg, bg, false);
+                      text, fg, bg, false);
 }
 
-// Le a pagina atual do SD e enche pageNames[]. So' e' chamada quando a
-// pagina muda (flip) ou o diretorio muda (entrou/saiu de pasta), nao a cada
-// tecla. Espelha o filtro do handleMenu original: pula "._*", pula "." e
-// "..", conta so' regular files e diretorios reais.
-static void menu_fillPage(void)
+// Copia o nome do item sob o cursor para selection[] e guarda se e' pasta.
+// E' aqui que o stat() por quadro deixou de ser necessario.
+static void menu_setSelection(void)
 {
-  pageCount = 0;
-  DIR* dir = opendir(romspath);
-  if (!dir) {
-    printf("ERRO: nao consegui abrir %s\n", romspath);
-    return;
+  if (curFile >= 0 && curFile < nbFiles && menuArena) {
+    strncpy(selection, ENTRY_NAME(curFile), MENU_NAME_MAXLEN);
+    selection[MENU_NAME_MAXLEN] = 0;
+    selIsDir = menuEntries[curFile].isDir;
+  } else {
+    selection[0] = 0;
+    selIsDir = false;
   }
-  int fileIndex = 0;
-  struct dirent* de;
-  while ((de = readdir(dir)) != NULL && pageCount < MAX_MENULINES) {
-    if (isJunkFile(de->d_name)) continue;
-    if ((de->d_type == DT_REG) ||
-        ((de->d_type == DT_DIR) && strcmp(de->d_name,".") && strcmp(de->d_name,".."))) {
-      if (fileIndex >= topFile) {
-        strncpy(pageNames[pageCount], de->d_name, MAX_FILENAME_SIZE);
-        pageNames[pageCount][MAX_FILENAME_SIZE] = 0;
-        pageCount++;
-      }
-      fileIndex++;
-    }
-  }
-  closedir(dir);
+}
+
+static void menu_drawHeader(void)
+{
+  // Caminho atual, na linha livre entre o titulo e a lista.
+  char path[40];
+  snprintf(path, sizeof(path), "%-38.38s", romspath);
+  video.drawTextNoDma(MENU_FILE_XOFFSET, TEXT_HEIGHT, path,
+                      RGBVAL16(0x80,0x80,0x80), RGBVAL16(0x00,0x00,0x00), false);
 }
 
 static void menu_drawFooter(void)
@@ -417,70 +545,71 @@ static void menu_drawFooter(void)
   int page  = (topFile / MAX_MENULINES) + 1;
   int pages = (nbFiles + MAX_MENULINES - 1) / MAX_MENULINES;
   if (pages < 1) pages = 1;
-  char footer[41];
-  snprintf(footer, sizeof(footer),
-           "ENTER=ok LR=pag F1=SWAP(%d) %d/%d",
+  char body[64], footer[40];
+  snprintf(body, sizeof(body), "ENTER=abrir <>=pag F1=SWAP(%d) %d/%d",
            emu_SwapJoysticks(1), page, pages);
+  // Largura fixa: sem isto, ao passar de "1/10" para "1/9" sobrava um digito
+  // do desenho anterior na tela.
+  snprintf(footer, sizeof(footer), "%-38.38s", body);
   video.drawTextNoDma(MENU_FILE_XOFFSET, MENU_FOOTER_YOFFSET, footer,
                       RGBVAL16(0x00,0xff,0xff), RGBVAL16(0x00,0x00,0x00), false);
 }
 
 static void menu_drawFullPage(void)
 {
-  menu_fillPage();
-  // Limpa a area inteira uma vez, depois desenha linha a linha. Mais rapido
-  // do que 24 drawRect individuais.
-  video.drawRectNoDma(MENU_FILE_XOFFSET, MENU_FILE_YOFFSET,
-                      MENU_FILE_W, MENU_FILE_H, MENU_FILE_BGCOLOR);
-  for (int row = 0; row < pageCount; row++) {
-    bool hl = (row + topFile) == curFile;
-    menu_drawLine(row, pageNames[row], hl);
-    if (hl) {
-      strncpy(selection, pageNames[row], MAX_FILENAME_SIZE);
-      selection[MAX_FILENAME_SIZE] = 0;
-    }
+  for (int row = 0; row < MAX_MENULINES; row++) {
+    int idx = topFile + row;
+    if (idx < nbFiles && menuArena)
+      menu_drawLine(row, ENTRY_NAME(idx), menuEntries[idx].isDir, idx == curFile);
+    else
+      menu_drawLine(row, NULL, false, false);
   }
+  menu_drawHeader();
   menu_drawFooter();
+}
+
+// Troca de diretorio (entrar numa pasta ou subir com "..").
+static void menu_changeDir(const char *name)
+{
+  if (menu_isUpEntry(name)) {
+    char *slash = strrchr(romspath, '/');
+    if (slash && slash != romspath) *slash = 0;
+  } else {
+    size_t used = strlen(romspath);
+    if (used && romspath[used-1] != '/') {
+      if (used + 1 < sizeof(romspath)) { romspath[used++] = '/'; romspath[used] = 0; }
+    }
+    // strncat com o espaco que REALMENTE sobra: romspath tem 64 bytes e um
+    // nome longo de subpasta estourava o buffer no strcpy/strcat originais.
+    strncat(romspath, name, sizeof(romspath) - strlen(romspath) - 1);
+  }
+  curFile     = 0;
+  topFile     = 0;
+  prevCurFile = -1;          // forca full redraw do novo diretorio
+  menu_rescan();
+  menu_setSelection();
+  menuRedraw = true;
 }
 
 int handleMenu(uint16_t bClick)
 {
   int action = ACTION_NONE;
 
-  char newpath[80];
-  strcpy(newpath, romspath);
-  strcat(newpath, "/");
-  strcat(newpath, selection);
-  
-  struct stat st;
-  bool newPathIsDir = false;
-  if(stat(newpath,&st) == 0)
-    if((st.st_mode & S_IFDIR) != 0)
-      newPathIsDir = true;
-
+  // O stat() que ficava aqui foi removido: era executado a cada iteracao do
+  // loop, com ou sem tecla, e cada chamada era um acesso ao SD. O
+  // selIsDir ja' vem do catalogo em RAM.
+  //
   // captureTouchZone() nunca dispara nesta placa (video.isTouching() e' um
-  // stub que sempre devolve false -- nao ha touchscreen na VGA32), entao os
-  // ramos que dependiam dela (atalho numerico 1-9, setas via toque) foram
-  // removidos daqui. A navegacao inteira vem do PS/2 e do gamepad da
-  // ponte T-Display, os dois entrando em bClick via MASK_JOY2_*.
+  // stub que sempre devolve false), entao os ramos de toque continuam fora.
   //
-  // ENTER (MASK_JOY2_BTN) faz tudo: se o item selecionado for pasta, entra
-  // nela; se for arquivo, roda. O F1 (USER1) so' alterna o SWAP -- antes ele
-  // tambem entrava em pasta, o que era redundante com o ENTER e confuso.
-  //
-  // As setas so' mexem em curFile. A decisao entre redesenho parcial (duas
-  // linhas) e full (pagina inteira) e' feita no bloco de desenho abaixo, a
-  // partir da comparacao entre topFile atual e o topFile derivado de curFile.
-  if ( (bClick & MASK_JOY2_BTN) && newPathIsDir ) {
-      menuRedraw=true;
-      strcpy(romspath,newpath);
-      curFile = 0;
-      topFile = 0;
-      prevCurFile = -1;   // forca full redraw do novo diretorio
-      nbFiles = readNbFiles();     
-  }
-  else if ( (bClick & MASK_JOY2_BTN) ) {
-      action = ACTION_RUN;       
+  // ENTER (MASK_JOY2_BTN) faz tudo: pasta -> entra; ".." -> sobe; arquivo ->
+  // roda. F1 (USER1) so' alterna o SWAP.
+  if (bClick & MASK_JOY2_BTN) {
+    if (selIsDir) {
+      menu_changeDir(selection);
+    } else if (nbFiles) {
+      action = ACTION_RUN;
+    }
   }
   else if (bClick & MASK_JOY2_UP) {
     if (curFile > 0) curFile--;
@@ -488,9 +617,7 @@ int handleMenu(uint16_t bClick)
   else if (bClick & MASK_JOY2_DOWN)  {
     if ((curFile < nbFiles-1) && nbFiles) curFile++;
   }
-  // LEFT/RIGHT = pagina inteira (util com muitos arquivos). Antes RIGHT
-  // pulava PRA CIMA e LEFT pulava PRA BAIXO -- herdado do layout de toque
-  // removido, mas contraintuitivo no teclado. Agora LEFT=cima, RIGHT=baixo.
+  // LEFT/RIGHT = pagina inteira. LEFT=cima, RIGHT=baixo.
   else if (bClick & MASK_JOY2_LEFT) {
     if (curFile >= MAX_MENULINES) curFile -= MAX_MENULINES;
     else curFile = 0;
@@ -502,36 +629,51 @@ int handleMenu(uint16_t bClick)
   else if (bClick & MASK_KEY_USER1) {
     emu_SwapJoysticks(0);
     menuRedraw=true;    // rodape mostra o novo estado do SWAP
-  }   
+  }
 
-  if (!nbFiles) return action;
+  // Ao rodar um jogo, libera o catalogo AGORA: selection[] ja' foi copiado
+  // (buffer separado da arena), entao a RAM dos nomes volta ao emulador antes
+  // do jogo carregar. O menu relê quando reabrir (toggleMenu).
+  if (action == ACTION_RUN) {
+    menu_freeCatalog();
+    return action;
+  }
+
+  if (!nbFiles) {
+    if (menuRedraw) { menu_drawFullPage(); menuRedraw = false; }
+    return action;
+  }
 
   // ---- Redesenho ---------------------------------------------------------
-  //
-  // Tres casos:
   //   1. menuRedraw setado (troca de pasta, SWAP, primeira entrada) -> full
   //   2. curFile mudou de pagina                                    -> full
-  //   3. curFile mudou de linha na mesma pagina                     -> parcial
+  //   3. curFile mudou de linha na mesma pagina                     -> 2 linhas
+  //   4. nada mudou                                                 -> NADA
+  //
+  // O caso 4 e' o que faltava: antes, mesmo sem tecla, o handleMenu ainda
+  // pagava o stat() do SD toda vez que era chamado.
 
   int newTopFile = (curFile / MAX_MENULINES) * MAX_MENULINES;
 
   if (menuRedraw || newTopFile != topFile || prevCurFile < 0) {
     topFile = newTopFile;
+    menu_setSelection();
     menu_drawFullPage();
     menuRedraw  = false;
     prevCurFile = curFile;
   }
-  else if (curFile != prevCurFile && pageCount > 0) {
+  else if (curFile != prevCurFile) {
     int oldRow = prevCurFile - topFile;
     int newRow = curFile     - topFile;
-    if (oldRow >= 0 && oldRow < pageCount) {
-      menu_drawLine(oldRow, pageNames[oldRow], false);
+    if (oldRow >= 0 && oldRow < MAX_MENULINES && (topFile+oldRow) < nbFiles) {
+      int i = topFile+oldRow;
+      menu_drawLine(oldRow, ENTRY_NAME(i), menuEntries[i].isDir, false);
     }
-    if (newRow >= 0 && newRow < pageCount) {
-      menu_drawLine(newRow, pageNames[newRow], true);
-      strncpy(selection, pageNames[newRow], MAX_FILENAME_SIZE);
-      selection[MAX_FILENAME_SIZE] = 0;
+    if (newRow >= 0 && newRow < MAX_MENULINES && (topFile+newRow) < nbFiles) {
+      int i = topFile+newRow;
+      menu_drawLine(newRow, ENTRY_NAME(i), menuEntries[i].isDir, true);
     }
+    menu_setSelection();
     prevCurFile = curFile;
   }
 
@@ -571,10 +713,6 @@ void emu_init(void)
 {
 
   esp_err_t ret = 0;
-
-#ifdef HAS_PS2KBD
-  ps2kbd_begin();
-#endif
 
   printf("mounting sd...\n");
 
@@ -628,11 +766,21 @@ void emu_init(void)
   }
   if (ret == ESP_OK) printf("SD montado a %d kHz\n", (int)SD_FREQ_KHZ);
 
+  // Teclado PS/2 SO' agora, com o SD ja' montado: ps2kbd_begin() le o
+  // /sdcard/bootl.rc para pegar os pinos CLK/DAT (fallback 33/32). Se
+  // inicializasse antes da montagem, o fopen falharia sempre e cairia no
+  // default mesmo com um bootl.rc valido no cartao.
+#ifdef HAS_PS2KBD
+  ps2kbd_begin();
+#endif
+
   strcpy(romspath,"/sdcard/");
   strcat(romspath,ROMSDIR);
+  strcpy(romsbase,romspath);   // limite do ".." -- nao sobe acima da pasta de ROMs
   printf("dir is : %s\n",romspath);
 
-  nbFiles = readNbFiles(); 
+  nbFiles = menu_rescan();
+  menu_setSelection();
   printf("SD initialized, files found: %d\n",nbFiles);
 
  
@@ -850,6 +998,16 @@ static int keypadval=0;
 static bool joySwapped = false;
 static uint16_t bLastState;
 
+// ----- Ritmo da navegacao do menu ----------------------------------------
+// Ajuste ao gosto: DELAY = espera antes de comecar a repetir ao SEGURAR a
+// seta; RATE = intervalo entre repeticoes depois disso.
+#define MENU_REP_DELAY_MS  320
+#define MENU_REP_RATE_MS    60
+
+static uint16_t menuPrevArrows = 0;
+static bool     menuPrevBtn    = false;
+static int64_t  menuNextRepUs  = 0;
+
 // Chamado ao entrar/sair do menu (de go.cpp via keys_resync). Sem isto o
 // bLastState fica com o valor do ultimo emu_GetMenuKeys(), que pode ter sido
 // ha' minutos, e a borda (bCurState & ~bLastState) na primeira leitura do
@@ -857,6 +1015,15 @@ static uint16_t bLastState;
 // o usuario tocar em nada.
 void emu_ResetKeyState(void) {
   bLastState = emu_ReadKeys();
+#ifdef HAS_PS2KBD
+  // Esvazia a fila de eventos ao entrar/sair do menu. Sem isto os repeats da
+  // propria tecla que abriu o menu (F9) vazavam para a primeira leitura e a
+  // lista "pulava sozinha".
+  for (int guard = 0; guard < 64; guard++) if (!ps2kbd_get_events()) break;
+#endif
+  menuPrevArrows = 0;
+  menuPrevBtn    = false;
+  menuNextRepUs  = 0;
 }
 static int xRef;
 static int yRef;
@@ -1037,7 +1204,16 @@ unsigned short emu_GetMenuKeys(void)
 #ifdef HAS_PS2KBD
   // Eventos do teclado: setas (nav) e ENTER (MASK_JOY2_BTN). Ja' vem
   // "pulsados", entao entram direto, sem passar pelo edge-detect.
-  bClick |= ps2kbd_get_events();
+  //
+  // O laco DRENA a fila inteira a cada chamada. Antes so' um lote saia por
+  // iteracao: quando o loop atrasava (era o stat() do SD), os auto-repeats do
+  // teclado se empilhavam e o cursor continuava andando depois da tecla
+  // solta -- o "buffer" reportado. Drenando sempre, o atraso nunca vira fila.
+  for (int guard = 0; guard < 64; guard++) {
+    uint16_t ev = ps2kbd_get_events();
+    if (!ev) break;
+    bClick |= ev;
+  }
 #endif
 
   // Botoes fisicos e gamepad continuam por borda. Mascaramos as setas e o
@@ -1065,6 +1241,40 @@ unsigned short emu_GetMenuKeys(void)
   levelClick &= ~(MASK_KEY_MENU | MASK_KEY_RESET | MASK_KEY_USER1);
 
   bClick |= levelClick;
+
+  // ---- Auto-repeat proprio ------------------------------------------------
+  // Com a fila drenada acima, segurar a seta produziria um passo por iteracao
+  // do loop -- rapido demais para escolher um jogo. O repeat passa a ser
+  // NOSSO: o primeiro toque anda na hora, depois espera MENU_REP_DELAY_MS e
+  // so' entao repete a cada MENU_REP_RATE_MS. Como e' baseado em relogio, e
+  // nao em contagem de eventos, a velocidade nao muda se o loop engasgar.
+  const uint16_t arrowBits = MASK_JOY2_UP|MASK_JOY2_DOWN|
+                             MASK_JOY2_LEFT|MASK_JOY2_RIGHT;
+  uint16_t arrows = bClick & arrowBits;
+  int64_t  now    = esp_timer_get_time();
+
+  if (arrows) {
+    if (arrows != menuPrevArrows) {          // tecla nova: passa e arma o delay
+      menuNextRepUs  = now + (int64_t)MENU_REP_DELAY_MS * 1000;
+      menuPrevArrows = arrows;
+    } else if (now < menuNextRepUs) {        // repeticao cedo demais: descarta
+      bClick &= ~arrowBits;
+    } else {
+      menuNextRepUs  = now + (int64_t)MENU_REP_RATE_MS * 1000;
+    }
+  } else {
+    menuPrevArrows = 0;
+  }
+
+  // ENTER nunca repete: so' a transicao solto->pressionado conta. Sem isto o
+  // auto-repeat podia carregar o jogo e, ao voltar ao menu, disparar de novo.
+  if (bClick & MASK_JOY2_BTN) {
+    if (menuPrevBtn) bClick &= ~MASK_JOY2_BTN;
+    else             menuPrevBtn = true;
+  } else {
+    menuPrevBtn = false;
+  }
+
   return bClick;
 }
 

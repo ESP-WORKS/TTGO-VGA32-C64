@@ -18,6 +18,11 @@ extern "C" {
 
 void ps2kbd_begin(void);
 
+// Pinos efetivos em uso pelo teclado PS/2 (default 33/32, ou lidos do
+// bootl.rc no SD, quando presentes e diferentes do default).
+int ps2kbd_get_clk_pin(void);
+int ps2kbd_get_dat_pin(void);
+
 // Devolve o proximo caractere ASCII pressionado, ou 0 se nao houver.
 // Consumido por emu_ReadI2CKeyboard(), que o core do C64 ja usa.
 int  ps2kbd_read_ascii(void);

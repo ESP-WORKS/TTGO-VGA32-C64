@@ -1962,32 +1962,7 @@ if ( cpu.vic.rasterLine >= LINECNT ) {
 /*****************************************************************************************************/
 
 void installPalette(void) {
-  // A paleta do arquivo esta' em indice RGB222 de 6 bits (PALETTE = VGA_RGB6).
-  // Convertemos AQUI para o byte RAW da FabGL, uma vez, para que a flushLine
-  // possa gravar o pixel direto do scratch sem consultar LUT nenhum.
-  // Tudo no VIC passa por cpu.vic.palette[]: os modos indexam ela, e o
-  // vic_write faz colors[i] = palette[valor], entao a conversao aqui se
-  // propaga sozinha para o desenho inteiro.
-  // Ordem: video.begin() roda antes do resetVic(), que e' quem chama esta
-  // funcao -- entao o LUT da FabGL ja' esta' pronto neste ponto.
-  for (unsigned i = 0; i < sizeof(cpu.vic.palette)/sizeof(cpu.vic.palette[0]); i++) {
-    cpu.vic.palette[i] = vga_raw_from_c6((uint8_t)palette[i]);
-  }
-
-  // colors[] TEM de sair daqui tambem. O resetVic() faz memset em cpu.vic
-  // inteiro, e so' o vic_write() repovoa colors[] -- ou seja, entre o reset e
-  // a primeira escrita do jogo em $D020..$D02E o vetor fica todo em zero.
-  //
-  // Isso era inofensivo enquanto a flushLine passava a cor pelo LUT: lut[0]
-  // devolvia preto COM os bits de sincronismo. Agora o valor vai cru para o
-  // framebuffer, e 0x00 nao tem bits de sync -- o monitor perde o sinal e
-  // leva segundos para re-sincronizar (o que aparecia como "a tela do C64
-  // demora a entrar" depois de escolher um jogo no menu).
-  //
-  // Preto e' o valor certo para o estado inicial; e' o indice 0 da paleta.
-  for (unsigned i = 0; i < sizeof(cpu.vic.colors)/sizeof(cpu.vic.colors[0]); i++) {
-    cpu.vic.colors[i] = cpu.vic.palette[0];
-  }
+ memcpy(cpu.vic.palette, (void*)palette, sizeof(cpu.vic.palette));
 }
 
 
@@ -2166,9 +2141,7 @@ void resetVic(void) {
 // em vic.cpp, entao colors[0] ja' esta nesse formato -- devolvemos direto.
 extern "C" uint16_t vic_get_border_color(void)
 {
-  // Sem mascara: colors[0] ja' e' o byte RAW da FabGL (bits de sync inclusos),
-  // e mascarar com 0x3F os destruiria.
-  return cpu.vic.colors[0];
+  return cpu.vic.colors[0] & 0x3F;
 }
 
 

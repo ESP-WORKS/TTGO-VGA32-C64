@@ -1,6 +1,11 @@
 #include <Arduino.h>
 #include <fabgl.h>
+#include <stdio.h>
 #include "ps2kbd.h"
+
+#ifndef SD_MOUNT_POINT
+#define SD_MOUNT_POINT "/sdcard"
+#endif
 
 // 1 = imprime cada tecla recebida no serial. Use para confirmar se o teclado
 // esta chegando antes de procurar problema no mapeamento.
@@ -42,6 +47,8 @@
 
 static fabgl::PS2Controller ps2;
 static bool     kbdReady = false;
+static int      s_kbd_clk = 33;  // pino CLK efetivo em uso (default ou do bootl.rc)
+static int      s_kbd_dat = 32;  // pino DAT efetivo em uso (default ou do bootl.rc)
 static uint16_t s_mask   = 0;   // ESTADO das teclas (nivel): para o jogo
 static uint8_t  s_held   = 0;   // ASCII da tecla atualmente SEGURADA
 
@@ -368,12 +375,45 @@ static void ps2kbd_poll(void)
 void ps2kbd_begin(void)
 {
   if (kbdReady) return;
+
+  // Le o bootl.rc do SD (gerado pelo bootloader) para obter os pinos do
+  // teclado PS/2. Formato: "kbddat=32\nkbdclk=33\nmagicb=36\n"
+  // Se o arquivo nao existir, usa os defaults (CLK=33, DAT=32).
+  int kbd_clk = -1, kbd_dat = -1;
+  {
+    FILE *f = fopen(SD_MOUNT_POINT "/bootl.rc", "r");
+    if (f) {
+      char line[32];
+      while (fgets(line, sizeof(line), f)) {
+        int val;
+        if (sscanf(line, "kbdclk=%d", &val) == 1) kbd_clk = val;
+        if (sscanf(line, "kbddat=%d", &val) == 1) kbd_dat = val;
+      }
+      fclose(f);
+      printf("[bootl.rc] CLK=%d DAT=%d\n", kbd_clk, kbd_dat);
+    } else {
+      printf("[bootl.rc] nao encontrado, usando defaults (CLK=33 DAT=32)\n");
+    }
+  }
+  // Pinos efetivos: do bootl.rc quando presentes, senao os defaults da placa.
+  s_kbd_clk = (kbd_clk < 0) ? 33 : kbd_clk;
+  s_kbd_dat = (kbd_dat < 0) ? 32 : kbd_dat;
+
   // CreateVirtualKeysQueue, nao GenerateVirtualKeys: e' este modo que faz a
   // FabGL manter a FILA de teclas. Com GenerateVirtualKeys ela converte o
   // scancode mas nao enfileira nada, entao virtualKeyAvailable() fica sempre
   // falso e getNextVirtualKey() nunca tem o que devolver -- exatamente o
   // sintoma de "teclado detectado mas nenhuma tecla chega".
-  ps2.begin(PS2Preset::KeyboardPort0, KbdMode::CreateVirtualKeysQueue);
+  if (s_kbd_clk == 33 && s_kbd_dat == 32) {
+    // Preset padrao -- FabGL configura os pinos automaticamente.
+    ps2.begin(PS2Preset::KeyboardPort0, KbdMode::CreateVirtualKeysQueue);
+  } else {
+    // Pinos personalizados lidos do bootl.rc.
+    ps2.begin((gpio_num_t)s_kbd_clk, (gpio_num_t)s_kbd_dat);
+    ps2.setKeyboard(new fabgl::Keyboard);
+    ps2.keyboard()->begin((gpio_num_t)s_kbd_clk, (gpio_num_t)s_kbd_dat,
+                           true, true);
+  }
   fabgl::Keyboard *kb = ps2.keyboard();
   if (kb) {
     // Layout US DE PROPOSITO, mesmo com teclado fisico ABNT2. O C64 real e'
@@ -436,6 +476,11 @@ uint16_t ps2kbd_get_events(void)
   return 0;
 }
 
+
+// Pinos efetivos do teclado PS/2 em uso (default 33/32, ou os lidos do
+// bootl.rc). Usados pelo rodape para mostrar a configuracao ativa.
+int ps2kbd_get_clk_pin(void) { return s_kbd_clk; }
+int ps2kbd_get_dat_pin(void) { return s_kbd_dat; }
 
 // Modo joystick atual: 0=OFF, 1=J1 (porta 1), 2=J2 (porta 2).
 // Usado pelo go.cpp para desenhar o indicador visual.
